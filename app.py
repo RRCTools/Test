@@ -1,4 +1,4 @@
 import streamlit as st
 
-st.title("👋 Hello!")
+st.title("👋 Hello Kitty!!!")
 st.write("Welcome! Thanks for visiting — hope you have a great day! 😊")
