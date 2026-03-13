@@ -292,3 +292,4 @@ elif st.session_state.page == "Summary":
         st.button("Export to Excel")
     with col2:
         st.button("Export PDF Report")
+   
