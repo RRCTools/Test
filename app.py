@@ -80,8 +80,12 @@ if "page" not in st.session_state:
 with st.sidebar:
     st.markdown("""
     <div style='padding:20px 0 24px 0; text-align:center;'>
-        <div style='font-size:1.4rem; font-weight:800; color:#fff; letter-spacing:3px;'>
-            RRC<span style='color:#e85d04;'>⚡</span>
+        <div style='display:flex; align-items:center; justify-content:center; gap:4px;'>
+            <span style='font-size:1.5rem; font-weight:900; color:#5a6272; letter-spacing:1px;'>RRC</span>
+            <svg width="32" height="12" viewBox="0 0 38 14" xmlns="http://www.w3.org/2000/svg" style="margin-bottom:-2px;">
+              <path d="M0 10 Q10 2 20 7 Q30 12 38 4" stroke="#4a90c4" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+              <path d="M0 13 Q10 6 20 10 Q30 14 38 8" stroke="#e85d04" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+            </svg>
         </div>
         <div style='font-size:0.7rem; color:#8b949e; letter-spacing:1.5px; margin-top:4px;'>
             LOSS REPORT CALCULATOR
@@ -117,9 +121,15 @@ with st.sidebar:
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class='rrc-header'>
-    <div class='rrc-logo-text'>RRC<span class='rrc-logo-accent'> ⚡ </span></div>
-    <div style='font-size:1rem; color:#c9d1d9; font-weight:500;'>Loss Report Calculator</div>
-    <div class='rrc-header-subtitle'>Full-Scope Energy Solutions</div>
+    <div style='display:flex; align-items:center; gap:4px;'>
+        <span style='font-size:1.8rem; font-weight:900; color:#5a6272; letter-spacing:1px;'>RRC</span>
+        <svg width="38" height="14" viewBox="0 0 38 14" xmlns="http://www.w3.org/2000/svg" style="margin-left:2px; margin-bottom:-2px;">
+          <path d="M0 10 Q10 2 20 7 Q30 12 38 4" stroke="#4a90c4" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+          <path d="M0 13 Q10 6 20 10 Q30 14 38 8" stroke="#e85d04" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+        </svg>
+    </div>
+    <div style='font-size:1rem; color:#c9d1d9; font-weight:500; margin-left:8px;'>Loss Report Calculator</div>
+    <div class='rrc-header-subtitle'>ETAP Loss Analyzer</div>
 </div>
 """, unsafe_allow_html=True)
 
