@@ -41,16 +41,20 @@ st.markdown("""
   .stButton > button { background: #e85d04 !important; color: white !important; border: none !important; border-radius: 6px !important; font-weight: 600 !important; }
   .stButton > button:hover { background: #c94d00 !important; }
   .unload-btn > button { background: #21262d !important; color: #f85149 !important; border: 1px solid #f85149 !important; font-size: 0.8rem !important; padding: 4px 12px !important; }
-  .stTabs [data-baseweb="tab-list"] { background: #161b22; border-bottom: 1px solid #21262d; }
-  .stTabs [data-baseweb="tab"] { color: #8b949e !important; }
-  .stTabs [aria-selected="true"] { color: #e85d04 !important; border-bottom: 2px solid #e85d04 !important; }
   .progress-bar-wrap { background: #21262d; border-radius: 4px; height: 6px; margin-top: 8px; }
   .progress-bar-fill { background: #e85d04; border-radius: 4px; height: 6px; }
+  .conv-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-bottom: 20px; }
+  .conv-table th { background: #21262d; color: #e85d04; text-align: left; padding: 10px 14px; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; }
+  .conv-table td { padding: 9px 14px; border-bottom: 1px solid #21262d; color: #c9d1d9; }
+  .conv-table tr:hover td { background: #1c2128; }
+  .conv-code { background: #21262d; color: #e85d04; padding: 2px 7px; border-radius: 4px; font-family: monospace; font-size: 0.85rem; font-weight: 600; }
+  .section-tag { display: inline-block; background: #1c2840; color: #58a6ff; padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 600; margin-left: 8px; vertical-align: middle; }
 </style>
 """, unsafe_allow_html=True)
 
 # Session state
-for k, v in [("etap_uploaded", False), ("sld_uploaded", False), ("page", "Upload"), ("etap_filename", ""), ("etap_filesize", 0)]:
+for k, v in [("etap_uploaded", False), ("sld_uploaded", False), ("page", "Upload"),
+             ("etap_filename", ""), ("etap_filesize", 0), ("sld_filename", "")]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -71,6 +75,12 @@ with st.sidebar:
     </div>
     <hr style='border-color:#21262d; margin-bottom:20px;'>
     """, unsafe_allow_html=True)
+
+    # Naming convention first
+    if st.button("📋  ETAP RRC Naming Convention", key="nav_Naming", use_container_width=True):
+        st.session_state.page = "Naming"
+
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 
     pages = [
         ("📁", "Upload",     "Upload Files"),
@@ -110,9 +120,134 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PAGE: NAMING CONVENTION
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.page == "Naming":
+
+    st.markdown("## 📋 ETAP RRC Naming Convention")
+    st.markdown("<p style='color:#8b949e; margin-bottom:28px;'>Standard component naming for RRC's ETAP studies. All uploaded ETAP files must follow these conventions.</p>", unsafe_allow_html=True)
+
+    # Download button for original docx
+    with open("/mnt/user-data/uploads/ETAP_Component_Names.docx", "rb") as f:
+        st.download_button(
+            label="⬇  Download Original Document (.docx)",
+            data=f,
+            file_name="ETAP_Component_Names.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+    st.markdown("<hr style='border-color:#21262d; margin:24px 0;'>", unsafe_allow_html=True)
+
+    # Introduction
+    st.markdown("""
+    <div class='rrc-card'>
+        <div class='rrc-card-header'>Introduction</div>
+        <div class='rrc-card-title'>Purpose &amp; Usage</div>
+        <p style='color:#c9d1d9; font-size:0.9rem; line-height:1.7;'>
+        The purpose of this section is to standardize equipment naming across RRC's ETAP studies.
+        This added consistency reduces mistakes and contributes to higher client satisfaction.
+        The below names should be used as the default naming conventions, with exceptions made where necessary.
+        </p>
+        <p style='color:#8b949e; font-size:0.85rem; line-height:1.6; margin-top:10px;'>
+        The first block should be built (block 01) according to the below naming conventions, entering as much data
+        as possible that is known at the time. When a component is copied/pasted, the component number 1 higher will
+        be in the dumpster — right click and select "Remove from Dumpster" to bring it into the oneline.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # AC Model table
+    st.markdown("### ⚡ AC Model Components")
+
+    st.markdown("""
+    <table class='conv-table'>
+      <tr><th>Component</th><th>Standard Name</th><th>Notes</th></tr>
+      <tr><td>Point of Interconnection</td><td><span class='conv-code'>POI</span></td><td></td></tr>
+      <tr><td>Main Power Transformer</td><td><span class='conv-code'>MPT 1</span></td><td></td></tr>
+      <tr><td>MPT Primary Bus</td><td><span class='conv-code'>MPT 1 HV</span></td><td></td></tr>
+      <tr><td>MPT Secondary Bus</td><td><span class='conv-code'>MPT 1 LV</span></td><td></td></tr>
+      <tr><td>MV Substation Bus</td><td><span class='conv-code'>34.5 kV MPT 1</span></td><td></td></tr>
+      <tr><td>MPT No Load Losses (Static Load)</td><td><span class='conv-code'>MPT 1 NLL</span></td><td></td></tr>
+      <tr><td>Generator Step Up Transformer</td><td><span class='conv-code'>GSU 01</span></td><td>Use 001 if 100+ power blocks</td></tr>
+      <tr><td>GSU Primary Bus</td><td><span class='conv-code'>GSU HV 01</span></td><td>If no accessible MV switchgear; else <span class='conv-code'>MV SWGR 01</span></td></tr>
+      <tr><td>GSU Secondary Bus</td><td><span class='conv-code'>GSU LV 01</span></td><td></td></tr>
+      <tr><td>Inverter Output</td><td><span class='conv-code'>INV AC 01</span></td><td></td></tr>
+      <tr><td>GSU No Load Losses (Static Load)</td><td><span class='conv-code'>GSU NLL 01</span></td><td></td></tr>
+      <tr><td>Expulsion Fuse</td><td><span class='conv-code'>EXP 01</span></td><td></td></tr>
+      <tr><td>Current Limiting Fuse</td><td><span class='conv-code'>CLF 01</span></td><td></td></tr>
+      <tr><td>MV Breaker</td><td><span class='conv-code'>CB 01</span></td><td></td></tr>
+      <tr><td>Current Transformer</td><td><span class='conv-code'>CT 01</span></td><td></td></tr>
+      <tr><td>MV Relay</td><td><span class='conv-code'>RELAY 01</span></td><td>Or name per drawings + 01</td></tr>
+      <tr><td>Auxiliary Transformer</td><td><span class='conv-code'>AUX XFMR 01</span></td><td></td></tr>
+      <tr><td>Aux Transformer Primary Bus</td><td><span class='conv-code'>AUX XFMR HV 01</span></td><td>Check drawings for alternate names</td></tr>
+      <tr><td>Aux Transformer Secondary Bus</td><td><span class='conv-code'>AUX XFMR LV 01</span></td><td>Check drawings for alternate names</td></tr>
+      <tr><td>Auxiliary Transformer Fuse</td><td><span class='conv-code'>AUX FUSE 01</span></td><td></td></tr>
+      <tr><td>Auxiliary Transformer Circuit Breaker</td><td><span class='conv-code'>AUX CB 01</span></td><td></td></tr>
+      <tr><td>Inverter</td><td><span class='conv-code'>INV 01</span></td><td></td></tr>
+      <tr><td>DC Bus</td><td><span class='conv-code'>DC 01</span></td><td></td></tr>
+      <tr><td>PV Array</td><td><span class='conv-code'>PV 01</span></td><td></td></tr>
+      <tr><td>MV Cables</td><td><span class='conv-code'>See IO Sheet</span></td><td>Circuit ID column in MV Circuits tab</td></tr>
+      <tr><td>Junction Box</td><td><span class='conv-code'>JB 01</span></td><td>Or per Single Line Drawing</td></tr>
+    </table>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 🏗 Substation Devices")
+    st.markdown("""
+    <table class='conv-table'>
+      <tr><th>Component</th><th>Standard Name</th><th>Notes</th></tr>
+      <tr><td>HV &amp; MV Breakers</td><td><span class='conv-code'>CB 1</span></td><td>Name after feeder number or per substation oneline drawing</td></tr>
+      <tr><td>MV Relay</td><td><span class='conv-code'>RELAY 1</span></td><td>Name after feeder number or per oneline / .RDB file</td></tr>
+      <tr><td>Current Transformer</td><td><span class='conv-code'>CT 1</span></td><td></td></tr>
+      <tr><td>Capacitor Bank</td><td><span class='conv-code'>CAP 1</span></td><td></td></tr>
+    </table>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style='background:#1c2840; border:1px solid #58a6ff; border-radius:8px; padding:14px 18px; margin-bottom:24px; font-size:0.87rem; color:#c9d1d9;'>
+        <b style='color:#58a6ff;'>BESS Projects:</b> Either add <span class='conv-code'>BESS</span> to the beginning of each component name, or name according to the project drawings.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Images
+    st.markdown("### 📸 Reference Examples")
+
+    import os
+    img_dir = "images"  # relative path for deployed app
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**MPT Example — Big Star Solar**")
+        try:
+            st.image("/mnt/user-data/uploads/ETAP_Component_Names.docx", use_container_width=True)
+        except:
+            pass
+        # Use the extracted images
+        img1_path = "/home/claude/unpacked_docx/word/media/image1.png"
+        if os.path.exists(img1_path):
+            st.image(img1_path, caption="MPT Example from Big Star Solar", use_container_width=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**HV & MV Breaker Example — Maplewood**")
+        img3_path = "/home/claude/unpacked_docx/word/media/image3.png"
+        if os.path.exists(img3_path):
+            st.image(img3_path, caption="HV & MV Breaker Example from Maplewood", use_container_width=True)
+
+    with col2:
+        st.markdown("**Power Block Example — Big Star Solar**")
+        img2_path = "/home/claude/unpacked_docx/word/media/image2.png"
+        if os.path.exists(img2_path):
+            st.image(img2_path, caption="Power Block Example from Big Star Solar", use_container_width=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**DC Model Example — Shoals BLA (Slate)**")
+        img4_path = "/home/claude/unpacked_docx/word/media/image4.png"
+        if os.path.exists(img4_path):
+            st.image(img4_path, caption="DC Model Example - Shoals BLA", use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE: UPLOAD
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.page == "Upload":
+elif st.session_state.page == "Upload":
 
     st.markdown("### Step 1 — Upload Project Files")
     st.markdown("<p style='color:#8b949e; margin-bottom:24px;'>Upload your ETAP losses file and Single Line Diagram to begin the loss analysis.</p>", unsafe_allow_html=True)
@@ -127,7 +262,6 @@ if st.session_state.page == "Upload":
         </div>
         """, unsafe_allow_html=True)
 
-        # If already loaded, show loaded state with unload option
         if st.session_state.etap_uploaded:
             st.success(f"All required sheets validated in **{st.session_state.etap_filename}**")
             st.markdown(
@@ -145,7 +279,6 @@ if st.session_state.page == "Upload":
                 st.session_state.etap_filesize = 0
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
-
         else:
             etap_file = st.file_uploader(
                 "Upload ETAP Excel file (.xlsx / .xls)",
@@ -153,13 +286,12 @@ if st.session_state.page == "Upload":
                 key="etap_uploader",
                 help="Excel file must contain sheets: General, Bus, Branch, Load, Source"
             )
-
             if etap_file:
                 try:
-                    xl = pd.ExcelFile(etap_file, engine="openpyxl" if etap_file.name.endswith(".xlsx") else "xlrd")
+                    engine = "openpyxl" if etap_file.name.endswith(".xlsx") else "xlrd"
+                    xl = pd.ExcelFile(etap_file, engine=engine)
                     found = xl.sheet_names
                     missing = [s for s in REQUIRED_SHEETS if s not in found]
-
                     if missing:
                         st.error(f"Missing sheet(s): **{', '.join(missing)}** — please re-upload the correct file.")
                         st.markdown(
@@ -178,7 +310,6 @@ if st.session_state.page == "Upload":
                         st.session_state.etap_filename = etap_file.name
                         st.session_state.etap_filesize = etap_file.size / 1024
                         st.rerun()
-
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
             else:
@@ -199,11 +330,11 @@ if st.session_state.page == "Upload":
         """, unsafe_allow_html=True)
 
         if st.session_state.sld_uploaded:
-            st.success(f"**{st.session_state.get('sld_filename', 'SLD file')}** uploaded successfully!")
+            st.success(f"**{st.session_state.sld_filename}** uploaded successfully!")
             st.markdown("<div class='unload-btn'>", unsafe_allow_html=True)
             if st.button("✕  Remove SLD File", key="unload_sld"):
                 st.session_state.sld_uploaded = False
-                st.session_state["sld_filename"] = ""
+                st.session_state.sld_filename = ""
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
         else:
@@ -211,22 +342,20 @@ if st.session_state.page == "Upload":
                 "Upload SLD file (.xlsx or .pdf)",
                 type=["xlsx", "xls", "pdf"],
                 key="sld_uploader",
-                help="SLD with standardized naming for automatic component identification"
             )
             if sld_file:
                 st.session_state.sld_uploaded = True
-                st.session_state["sld_filename"] = sld_file.name
+                st.session_state.sld_filename = sld_file.name
                 st.rerun()
             else:
                 st.markdown(
                     "<div style='font-size:0.82rem; color:#8b949e; margin-top:8px; padding:12px; background:#0d1117; border-radius:6px; border:1px solid #21262d;'>"
                     "&#128269; <b style='color:#c9d1d9;'>Auto-detected via naming convention:</b><br>"
-                    "&nbsp;&nbsp;· Inverters — INV_xxx<br>"
-                    "&nbsp;&nbsp;· Transformers — TX_xxx<br>"
-                    "&nbsp;&nbsp;· Main Power TX — MPT_xxx<br>"
-                    "&nbsp;&nbsp;· MV Cables — MVCAB_xxx<br>"
-                    "&nbsp;&nbsp;· Transmission Lines — TL_xxx<br>"
-                    "&nbsp;&nbsp;· Auxiliary Loads — AUX_xxx"
+                    "&nbsp;&nbsp;· Inverters — <span style='color:#e85d04;'>INV 01</span><br>"
+                    "&nbsp;&nbsp;· GSU Transformers — <span style='color:#e85d04;'>GSU 01</span><br>"
+                    "&nbsp;&nbsp;· Main Power TX — <span style='color:#e85d04;'>MPT 1</span><br>"
+                    "&nbsp;&nbsp;· MV Cables — <span style='color:#e85d04;'>See IO Sheet</span><br>"
+                    "&nbsp;&nbsp;· Auxiliary Transformer — <span style='color:#e85d04;'>AUX XFMR 01</span>"
                     "</div>",
                     unsafe_allow_html=True
                 )
@@ -272,16 +401,16 @@ def loss_page(step, title, subtitle, components):
             st.markdown(f"{icon} {label}")
 
 if st.session_state.page == "LV Losses":
-    loss_page(2, "LV Loss Breakdown", "Low voltage losses from inverters, LV transformers, and LV cables.",
-              [("🔋", "Inverters (INV_xxx)"), ("🔲", "LV Transformers (TX_LV_xxx)"), ("〰️", "LV Cables (LVCAB_xxx)")])
+    loss_page(2, "LV Loss Breakdown", "Low voltage losses from inverters, GSU transformers, and LV cables.",
+              [("🔋", "INV 01"), ("🔲", "GSU 01"), ("〰️", "GSU LV 01")])
 
 elif st.session_state.page == "MV Losses":
-    loss_page(3, "MV Loss Breakdown", "Medium voltage losses from MV cables, transformers, and feeder circuits.",
-              [("⚡", "MV Cables (MVCAB_xxx)"), ("🔲", "Main Power TX (MPT_xxx)"), ("〰️", "Transmission Lines (TL_xxx)")])
+    loss_page(3, "MV Loss Breakdown", "Medium voltage losses from MV cables, GSU HV buses, and Main Power Transformer.",
+              [("⚡", "MV Cables (IO Sheet)"), ("🔲", "MPT 1"), ("〰️", "GSU HV 01")])
 
 elif st.session_state.page == "Aux Losses":
-    loss_page(4, "Auxiliary Losses", "Auxiliary power consumption and parasitic losses.",
-              [("🔧", "Aux Loads (AUX_xxx)"), ("🏭", "Station Service"), ("📡", "Controls & SCADA")])
+    loss_page(4, "Auxiliary Losses", "Auxiliary transformer and station service losses.",
+              [("🔧", "AUX XFMR 01"), ("🏭", "AUX XFMR LV 01"), ("📡", "AUX CB 01")])
 
 elif st.session_state.page == "Summary":
     st.markdown("### Step 5 — Total Loss Summary")
