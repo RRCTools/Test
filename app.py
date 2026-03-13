@@ -12,7 +12,7 @@ st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
   html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-  #MainMenu, footer, header { visibility: hidden; }
+  #MainMenu, footer { visibility: hidden; } header { visibility: visible; }
   .stApp { background-color: #0d1117; color: #e6edf3; }
   [data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #21262d; }
   [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
@@ -145,18 +145,25 @@ if st.session_state.page == "Naming":
 
     # Introduction
     st.markdown("""
-    <div class='rrc-card'>
+    <div class='rrc-card' style='max-height:260px; overflow-y:auto;'>
         <div class='rrc-card-header'>Introduction</div>
-        <div class='rrc-card-title'>Purpose &amp; Usage</div>
+        <div class='rrc-card-title'>Component Naming Convention for Solar Projects</div>
         <p style='color:#c9d1d9; font-size:0.9rem; line-height:1.7;'>
-        The purpose of this section is to standardize equipment naming across RRC's ETAP studies.
-        This added consistency reduces mistakes and contributes to higher client satisfaction.
-        The below names should be used as the default naming conventions, with exceptions made where necessary.
+        The purpose of this section is to standardize the equipment naming across RRC's ETAP studies.
+        This added consistency will reduce mistakes and contribute to higher client satisfaction.
+        The below names should be used as the default naming conventions, with exceptions being made where necessary.
         </p>
-        <p style='color:#8b949e; font-size:0.85rem; line-height:1.6; margin-top:10px;'>
-        The first block should be built (block 01) according to the below naming conventions, entering as much data
-        as possible that is known at the time. When a component is copied/pasted, the component number 1 higher will
-        be in the dumpster — right click and select "Remove from Dumpster" to bring it into the oneline.
+        <p style='color:#c9d1d9; font-size:0.9rem; line-height:1.7; margin-top:10px;'>
+        The first block should be built (block 01) according to the below naming conventions, while entering as much
+        data as possible that is known at the time. Even if the protective devices are not known, it is much easier
+        to enter that information later, than it is to add a component to every block.
+        </p>
+        <p style='color:#c9d1d9; font-size:0.9rem; line-height:1.7; margin-top:10px;'>
+        When a component is copied/pasted, the component number 1 higher will be in the dumpster. You must right click
+        and select "Remove from Dumpster" to bring it into the oneline. When there is a leading zero (ex: GSU 01),
+        the component "GSU 1" will be in the dumpster, and "GSU 2" will appear on the oneline. In this case, it is
+        best to leave the components in the dumpster, paste all the blocks that are needed, and add the leading zeros
+        once all blocks are pasted.
         </p>
     </div>
     """, unsafe_allow_html=True)
