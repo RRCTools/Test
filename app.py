@@ -421,6 +421,12 @@ if st.session_state.page == "LV Losses":
         load_df   = st.session_state.etap_data["load"]
 
         # ── Load Losses from Branch sheet ──────────────────────────────────
+        # Drop rows where ID is NaN before any string operations
+        branch_df = branch_df.dropna(subset=["ID"]).copy()
+        branch_df["ID"] = branch_df["ID"].astype(str)
+        load_df = load_df.dropna(subset=["ID"]).copy()
+        load_df["ID"] = load_df["ID"].astype(str)
+
         lv_cables = branch_df[branch_df["ID"].str.upper().str.startswith("LV")].copy()
         lv_cables["Category"] = "LV Cable"
 
