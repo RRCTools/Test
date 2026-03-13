@@ -311,6 +311,12 @@ elif st.session_state.page == "Upload":
                         st.session_state.etap_uploaded = True
                         st.session_state.etap_filename = etap_file.name
                         st.session_state.etap_filesize = etap_file.size / 1024
+                        # Parse and cache all sheets
+                        st.session_state.etap_data = {
+                            "branch": pd.read_excel(etap_file, sheet_name="Branch", engine=engine),
+                            "load":   pd.read_excel(etap_file, sheet_name="Load",   engine=engine),
+                            "bus":    pd.read_excel(etap_file, sheet_name="Bus",     engine=engine),
+                        }
                         st.rerun()
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
@@ -403,8 +409,90 @@ def loss_page(step, title, subtitle, components):
             st.markdown(f"{icon} {label}")
 
 if st.session_state.page == "LV Losses":
-    loss_page(2, "LV Loss Breakdown", "Low voltage losses from inverters, GSU transformers, and LV cables.",
-              [("🔋", "INV 01"), ("🔲", "GSU 01"), ("〰️", "GSU LV 01")])
+    st.markdown("### Step 2 — LV Loss Breakdown")
+    st.markdown("<p style='color:#8b949e; margin-bottom:24px;'>Low voltage load losses (Branch sheet) and no-load losses (Load sheet) for LV cables and auxiliary transformers.</p>", unsafe_allow_html=True)
+
+    if not st.session_state.etap_uploaded:
+        st.warning("Please upload and validate the ETAP file first (Step 1 — Upload).")
+    elif "etap_data" not in st.session_state:
+        st.warning("ETAP data not parsed yet. Please re-upload the file.")
+    else:
+        branch_df = st.session_state.etap_data["branch"]
+        load_df   = st.session_state.etap_data["load"]
+
+        # ── Load Losses from Branch sheet ──────────────────────────────────
+        # LV Cables: ID starts with LV
+        lv_cables = branch_df[branch_df["ID"].str.upper().str.startswith("LV")].copy()
+        lv_cables["Category"] = "LV Cable"
+
+        # UAT Transformers: ID starts with UAT and has kW Losses (primary winding only, -P)
+        uat_tx = branch_df[
+            branch_df["ID"].str.upper().str.startswith("UAT") &
+            branch_df["ID"].str.upper().str.endswith("-P") &
+            branch_df["kW Losses"].notna()
+        ].copy()
+        uat_tx["Category"] = "Aux Transformer (UAT)"
+
+        load_losses_df = pd.concat([lv_cables, uat_tx])[
+            ["Category", "ID", "Type", "kW Losses"]
+        ].dropna(subset=["kW Losses"]).reset_index(drop=True)
+        load_losses_df.columns = ["Category", "Component ID", "Type", "kW Losses"]
+
+        # ── No-Load Losses from Load sheet ─────────────────────────────────
+        uat_loads = load_df[load_df["ID"].str.upper().str.contains("UAT")].copy()
+        uat_loads["Category"] = "Aux Transformer No-Load (UAT)"
+        no_load_df = uat_loads[["Category", "ID", "kW"]].reset_index(drop=True)
+        no_load_df.columns = ["Category", "Component ID", "kW No-Load"]
+
+        # ── Totals ──────────────────────────────────────────────────────────
+        total_load    = load_losses_df["kW Losses"].sum()
+        total_noload  = no_load_df["kW No-Load"].sum()
+        total_lv      = total_load + total_noload
+
+        # ── Metric cards ────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div class='metric-row'>
+            <div class='metric-card orange'>
+                <div class='metric-label'>Load Losses (Branch)</div>
+                <div class='metric-value'>{total_load:,.2f}<span class='metric-unit'>kW</span></div>
+            </div>
+            <div class='metric-card blue'>
+                <div class='metric-label'>No-Load Losses (Load)</div>
+                <div class='metric-value'>{total_noload:,.2f}<span class='metric-unit'>kW</span></div>
+            </div>
+            <div class='metric-card highlight'>
+                <div class='metric-label'>Total LV Losses</div>
+                <div class='metric-value'>{total_lv:,.2f}<span class='metric-unit'>kW</span></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<hr style='border-color:#21262d; margin:20px 0;'>", unsafe_allow_html=True)
+
+        # ── Load Losses Table ────────────────────────────────────────────────
+        st.markdown("#### ⚡ Load Losses — Branch Sheet")
+        st.markdown(f"<p style='color:#8b949e; font-size:0.85rem;'>{len(load_losses_df)} components &nbsp;·&nbsp; Total: <b style='color:#e85d04;'>{total_load:,.2f} kW</b></p>", unsafe_allow_html=True)
+
+        # Style the dataframe
+        styled = load_losses_df.style.format({"kW Losses": "{:.4f}"}) \
+            .set_properties(**{"background-color": "#0d1117", "color": "#c9d1d9", "border": "1px solid #21262d"}) \
+            .set_table_styles([{"selector": "th", "props": [("background-color", "#21262d"), ("color", "#e85d04"), ("font-size", "0.8rem")]}])
+        st.dataframe(load_losses_df, use_container_width=True, hide_index=True)
+
+        # Sub-totals by category
+        cat_totals = load_losses_df.groupby("Category")["kW Losses"].sum().reset_index()
+        cat_totals.columns = ["Category", "Subtotal kW"]
+        col1, col2 = st.columns(2)
+        with col1:
+            for _, row in cat_totals.iterrows():
+                st.markdown(f"<div style='background:#161b22; border:1px solid #21262d; border-radius:6px; padding:10px 14px; margin-bottom:8px; font-size:0.85rem;'><span style='color:#8b949e;'>{row['Category']}</span><span style='float:right; color:#e85d04; font-weight:600;'>{row['Subtotal kW']:,.4f} kW</span></div>", unsafe_allow_html=True)
+
+        st.markdown("<hr style='border-color:#21262d; margin:20px 0;'>", unsafe_allow_html=True)
+
+        # ── No-Load Losses Table ─────────────────────────────────────────────
+        st.markdown("#### 🔲 No-Load Losses — Load Sheet")
+        st.markdown(f"<p style='color:#8b949e; font-size:0.85rem;'>{len(no_load_df)} components &nbsp;·&nbsp; Total: <b style='color:#58a6ff;'>{total_noload:,.2f} kW</b></p>", unsafe_allow_html=True)
+        st.dataframe(no_load_df, use_container_width=True, hide_index=True)
 
 elif st.session_state.page == "MV Losses":
     loss_page(3, "MV Loss Breakdown", "Medium voltage losses from MV cables, GSU HV buses, and Main Power Transformer.",
