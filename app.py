@@ -60,6 +60,47 @@ for k, v in [("etap_uploaded", False), ("sld_uploaded", False), ("page", "Upload
 
 REQUIRED_SHEETS = ["General", "Bus", "Branch", "Load", "Source"]
 
+import re, io
+
+def parse_sld(sld_file):
+    """Extract component IDs from SLD PDF or Excel using naming convention."""
+    fname = sld_file.name.lower()
+    text = ""
+    if fname.endswith(".pdf"):
+        try:
+            import pdfplumber
+            with pdfplumber.open(sld_file) as pdf:
+                for page in pdf.pages:
+                    text += (page.extract_text() or "") + " "
+        except Exception as e:
+            return {"error": str(e)}
+    elif fname.endswith((".xlsx", ".xls")):
+        engine = "openpyxl" if fname.endswith(".xlsx") else "xlrd"
+        xl = pd.ExcelFile(sld_file, engine=engine)
+        for sheet in xl.sheet_names:
+            df = xl.parse(sheet)
+            for col in df.columns:
+                text += " ".join(df[col].dropna().astype(str).tolist()) + " "
+
+    tokens = re.findall(r'[A-Za-z0-9_.\-]+', text)
+    result = {
+        "INV":   sorted(set(t for t in tokens if re.match(r'INV\.', t, re.I))),
+        "MVT":   sorted(set(t for t in tokens if re.match(r'MVT\.', t, re.I))),
+        "CABLE": sorted(set(t for t in tokens if re.match(r'CABLE\.', t, re.I))),
+        "MV_FEEDER": sorted(set(t for t in tokens if re.match(r'MV[-_]', t, re.I) and len(t) > 5)),
+        "NLL":   sorted(set(t for t in tokens if re.match(r'NLL\.', t, re.I))),
+        "CB":    sorted(set(t for t in tokens if re.match(r'CB\.', t, re.I))),
+        "BATT":  sorted(set(t for t in tokens if re.match(r'BATT\.', t, re.I))),
+        "MPT":   sorted(set(t for t in tokens if re.match(r'MPT', t, re.I) and 'NLL' not in t.upper())),
+        "GSU":   sorted(set(t for t in tokens if re.match(r'GSU', t, re.I))),
+        "UAT":   sorted(set(t for t in tokens if re.match(r'UAT', t, re.I))),
+        "LV":    sorted(set(t for t in tokens if re.match(r'LV[._]', t, re.I))),
+        "ISU":   sorted(set(t for t in tokens if re.match(r'ISU\.', t, re.I))),
+        "PV":    sorted(set(t for t in tokens if re.match(r'PV\.', t, re.I))),
+        "SWGR":  sorted(set(t for t in tokens if re.match(r'SWGR\.', t, re.I))),
+    }
+    return result
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
@@ -84,6 +125,7 @@ with st.sidebar:
 
     pages = [
         ("📁", "Upload",     "Upload Files"),
+        ("🔍", "SLD Check",  "SLD vs Excel Check"),
         ("🔌", "LV Losses",  "LV Loss Breakdown"),
         ("⚡", "MV Losses",  "MV Loss Breakdown"),
         ("🔧", "Aux Losses", "Auxiliary Losses"),
@@ -352,8 +394,10 @@ elif st.session_state.page == "Upload":
                 key="sld_uploader",
             )
             if sld_file:
+                sld_components = parse_sld(sld_file)
                 st.session_state.sld_uploaded = True
                 st.session_state.sld_filename = sld_file.name
+                st.session_state.sld_components = sld_components
                 st.rerun()
             else:
                 st.markdown(
@@ -408,7 +452,110 @@ def loss_page(step, title, subtitle, components):
         with cols[i]:
             st.markdown(f"{icon} {label}")
 
-if st.session_state.page == "LV Losses":
+if st.session_state.page == "SLD Check":
+    st.markdown("### 🔍 SLD vs Excel Component Check")
+    st.markdown("<p style='color:#8b949e; margin-bottom:24px;'>Preliminary check comparing component counts between the uploaded SLD and ETAP Excel file.</p>", unsafe_allow_html=True)
+
+    if not st.session_state.etap_uploaded:
+        st.warning("Please upload and validate the ETAP file first.")
+    elif not st.session_state.sld_uploaded:
+        st.warning("Please upload the SLD file first.")
+    elif "sld_components" not in st.session_state:
+        st.warning("SLD was uploaded before parsing was available. Please remove and re-upload the SLD file.")
+    elif "error" in st.session_state.sld_components:
+        st.error(f"Could not parse SLD: {st.session_state.sld_components['error']}")
+    else:
+        sld = st.session_state.sld_components
+        branch_df = st.session_state.etap_data["branch"].copy()
+        load_df   = st.session_state.etap_data["load"].copy()
+        branch_df["ID"] = branch_df["ID"].astype(str)
+        load_df["ID"]   = load_df["ID"].astype(str)
+
+        # Build Excel component counts
+        excel_counts = {
+            "INV":        len(branch_df[branch_df["ID"].str.upper().str.startswith("INV.")]),
+            "MVT":        len(branch_df[branch_df["ID"].str.upper().str.startswith("MVT.") & branch_df["ID"].str.upper().str.endswith("-P")]),
+            "CABLE":      len(branch_df[branch_df["ID"].str.upper().str.startswith("CABLE.")]),
+            "MV_FEEDER":  len(branch_df[branch_df["ID"].str.upper().str.startswith("MV-")]),
+            "NLL":        len(load_df[load_df["ID"].str.upper().str.startswith("NLL.")]),
+            "CB":         len(branch_df[branch_df["ID"].str.upper().str.startswith("CB.")]),
+            "MPT":        len(branch_df[branch_df["ID"].str.upper().str.startswith("MPT") & branch_df["ID"].str.upper().str.endswith("-P")]),
+            "GSU":        len(branch_df[branch_df["ID"].str.upper().str.startswith("GSU") & branch_df["ID"].str.upper().str.endswith("-P")]),
+            "UAT":        len(branch_df[branch_df["ID"].str.upper().str.startswith("UAT") & branch_df["ID"].str.upper().str.endswith("-P")]),
+            "LV":         len(branch_df[branch_df["ID"].str.upper().str.startswith("LV")]),
+            "BATT":       0,
+        }
+
+        labels = {
+            "INV": "Inverters (INV)",
+            "MVT": "MV Transformers (MVT)",
+            "CABLE": "MV Cables (CABLE)",
+            "MV_FEEDER": "MV Feeder Segments (MV-)",
+            "NLL": "No-Load Loss Loads (NLL)",
+            "CB": "Circuit Breakers (CB)",
+            "MPT": "Main Power Transformer (MPT)",
+            "GSU": "GSU Transformers (GSU)",
+            "UAT": "Aux Transformers (UAT)",
+            "LV": "LV Components (LV)",
+            "BATT": "Battery Units (BATT)",
+        }
+
+        rows = []
+        for key, label in labels.items():
+            sld_count = len(sld.get(key, []))
+            exc_count = excel_counts.get(key, 0)
+            if sld_count == 0 and exc_count == 0:
+                continue
+            match = sld_count == exc_count
+            rows.append({
+                "Component": label,
+                "SLD Count": sld_count,
+                "Excel Count": exc_count,
+                "Status": "✅ Match" if match else f"⚠️ Diff: {abs(sld_count - exc_count)}"
+            })
+
+        matches   = sum(1 for r in rows if "Match" in r["Status"])
+        mismatches = sum(1 for r in rows if "Diff" in r["Status"])
+
+        st.markdown(f"""
+        <div class='metric-row'>
+            <div class='metric-card green'>
+                <div class='metric-label'>Matching</div>
+                <div class='metric-value'>{matches}</div>
+            </div>
+            <div class='metric-card orange'>
+                <div class='metric-label'>Mismatches</div>
+                <div class='metric-value'>{mismatches}</div>
+            </div>
+            <div class='metric-card highlight'>
+                <div class='metric-label'>Total Checked</div>
+                <div class='metric-value'>{len(rows)}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("<hr style='border-color:#21262d; margin:20px 0;'>", unsafe_allow_html=True)
+
+        for row in rows:
+            is_match = "Match" in row["Status"]
+            border = "#3fb950" if is_match else "#e85d04"
+            status_color = "#3fb950" if is_match else "#f0a500"
+            st.markdown(
+                f"<div style='background:#161b22; border:1px solid {border}; border-radius:6px; padding:12px 16px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;'>"
+                f"<span style='color:#c9d1d9; font-size:0.9rem;'>{row['Component']}</span>"
+                f"<span style='color:#8b949e; font-size:0.85rem;'>SLD: <b style='color:#58a6ff;'>{row['SLD Count']}</b> &nbsp;|&nbsp; Excel: <b style='color:#e85d04;'>{row['Excel Count']}</b></span>"
+                f"<span style='color:{status_color}; font-weight:600; font-size:0.85rem;'>{row['Status']}</span>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+        if mismatches > 0:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.warning("⚠️ Some component counts differ between SLD and Excel. Review mismatches before proceeding with loss calculations.")
+        else:
+            st.success("✅ All component counts match between SLD and Excel file!")
+
+elif st.session_state.page == "LV Losses":
     st.markdown("### Step 2 — LV Loss Breakdown")
     st.markdown("<p style='color:#8b949e; margin-bottom:24px;'>Low voltage load losses (Branch sheet) and no-load losses (Load sheet) for LV cables and auxiliary transformers.</p>", unsafe_allow_html=True)
 
