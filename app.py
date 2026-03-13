@@ -128,13 +128,18 @@ if st.session_state.page == "Naming":
     st.markdown("<p style='color:#8b949e; margin-bottom:28px;'>Standard component naming for RRC's ETAP studies. All uploaded ETAP files must follow these conventions.</p>", unsafe_allow_html=True)
 
     # Download button for original docx
-    with open("/mnt/user-data/uploads/ETAP_Component_Names.docx", "rb") as f:
-        st.download_button(
-            label="⬇  Download Original Document (.docx)",
-            data=f,
-            file_name="ETAP_Component_Names.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        )
+    import os
+    docx_path = "ETAP_Component_Names.docx"
+    if os.path.exists(docx_path):
+        with open(docx_path, "rb") as f:
+            st.download_button(
+                label="⬇  Download Original Document (.docx)",
+                data=f,
+                file_name="ETAP_Component_Names.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+    else:
+        st.info("Place ETAP_Component_Names.docx in your repo root to enable download.")
 
     st.markdown("<hr style='border-color:#21262d; margin:24px 0;'>", unsafe_allow_html=True)
 
@@ -209,38 +214,28 @@ if st.session_state.page == "Naming":
     """, unsafe_allow_html=True)
 
     # Images
-    st.markdown("### 📸 Reference Examples")
-
     import os
-    img_dir = "images"  # relative path for deployed app
+    st.markdown("### 📸 Reference Examples")
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**MPT Example — Big Star Solar**")
-        try:
-            st.image("/mnt/user-data/uploads/ETAP_Component_Names.docx", use_container_width=True)
-        except:
-            pass
-        # Use the extracted images
-        img1_path = "/home/claude/unpacked_docx/word/media/image1.png"
-        if os.path.exists(img1_path):
-            st.image(img1_path, caption="MPT Example from Big Star Solar", use_container_width=True)
+        if os.path.exists("images/image1.png"):
+            st.image("images/image1.png", caption="MPT Example from Big Star Solar", use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("**HV & MV Breaker Example — Maplewood**")
-        img3_path = "/home/claude/unpacked_docx/word/media/image3.png"
-        if os.path.exists(img3_path):
-            st.image(img3_path, caption="HV & MV Breaker Example from Maplewood", use_container_width=True)
+        if os.path.exists("images/image3.png"):
+            st.image("images/image3.png", caption="HV & MV Breaker Example from Maplewood", use_container_width=True)
 
     with col2:
         st.markdown("**Power Block Example — Big Star Solar**")
-        img2_path = "/home/claude/unpacked_docx/word/media/image2.png"
-        if os.path.exists(img2_path):
-            st.image(img2_path, caption="Power Block Example from Big Star Solar", use_container_width=True)
+        if os.path.exists("images/image2.png"):
+            st.image("images/image2.png", caption="Power Block Example from Big Star Solar", use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("**DC Model Example — Shoals BLA (Slate)**")
-        img4_path = "/home/claude/unpacked_docx/word/media/image4.png"
+        img4_path = "images/image4.png"
         if os.path.exists(img4_path):
             st.image(img4_path, caption="DC Model Example - Shoals BLA", use_container_width=True)
 
