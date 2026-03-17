@@ -3,7 +3,7 @@ import pandas as pd
 
 st.set_page_config(
     page_title="RRC Loss Report Calculator",
-    page_icon="⚡",
+    page_icon="⚡⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
