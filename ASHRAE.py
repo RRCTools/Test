@@ -24,9 +24,11 @@ import pandas as pd
 
 # ── API constants ─────────────────────────────────────────────────────────────
 
-# Streamlit Cloud blocks outbound HTTP — route through HTTPS proxy
-STATION_URL = "https://corsproxy.io/?url=http://ashrae-meteo.info/request_places.php"
-METEO_URL   = "https://corsproxy.io/?url=http://ashrae-meteo.info/request_meteo_parametres.php"
+# Streamlit Cloud blocks outbound HTTP — route all calls through HTTPS proxy as GET requests
+# ashrae-meteo.info accepts GET params for all endpoints
+ASHRAE_BASE  = "http://ashrae-meteo.info"
+PROXY_PREFIX = "https://corsproxy.io/?url="
+PROXY_BACKUP = "https://api.allorigins.win/raw?url="
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -50,47 +52,37 @@ DISPLAY_ROWS = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _post(url: str, params: dict) -> dict:
+def _get(endpoint: str, params: dict) -> dict:
     """
-    POST to ashrae-meteo.info via corsproxy.io.
-    corsproxy.io forwards POST body correctly when Content-Type is set.
-    Falls back to GET with query params if POST fails.
+    GET from ashrae-meteo.info via HTTPS proxy.
+    Builds: PROXY_PREFIX + url_encode(ASHRAE_BASE + endpoint + ?params)
+    Falls back to allorigins if corsproxy fails.
     """
-    try:
-        # Try POST first (corsproxy forwards body + headers)
-        resp = requests.post(
-            url,
-            data=params,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20,
-        )
-        raw = resp.content.decode("utf-8-sig").strip()
-        if raw and raw[0] in ("{", "["):
-            return json.loads(raw)
-        raise ValueError(f"Non-JSON response: {raw[:120]}")
-    except Exception as e_post:
-        # Fallback: GET with query params appended to URL
+    import urllib.parse
+
+    target = ASHRAE_BASE + endpoint + "?" + urllib.parse.urlencode(params)
+    
+    for proxy in [PROXY_PREFIX, PROXY_BACKUP]:
         try:
-            import urllib.parse
-            qs  = urllib.parse.urlencode(params)
-            # For corsproxy, append params to the proxied URL before encoding
-            base_url = url  # already includes ?url=http://...
-            # Extract the inner URL and append params
-            if "?url=" in url:
-                proxy_prefix, inner = url.split("?url=", 1)
-                inner_with_params = inner + ("&" if "?" in inner else "?") + qs
-                get_url = proxy_prefix + "?url=" + urllib.parse.quote(inner_with_params, safe="")
-            else:
-                get_url = url + ("&" if "?" in url else "?") + qs
-            resp2 = requests.get(get_url, timeout=20)
-            raw2  = resp2.content.decode("utf-8-sig").strip()
-            return json.loads(raw2)
-        except Exception as e_get:
-            return {"_error": f"POST failed: {e_post} | GET fallback failed: {e_get}"}
+            url  = proxy + urllib.parse.quote(target, safe="")
+            resp = requests.get(url, timeout=20, headers={"Accept": "application/json"})
+            raw  = resp.content.decode("utf-8-sig").strip()
+            if not raw:
+                continue
+            data = json.loads(raw)
+            # allorigins wraps in {"contents": "..."} — unwrap if needed
+            if "contents" in data and isinstance(data["contents"], str):
+                data = json.loads(data["contents"])
+            return data
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    return {"_error": f"Both proxies failed. Last error: {last_err}"}
 
 
 def find_station(lat: float, lon: float, version: str = "2021") -> dict:
-    data     = _post(STATION_URL, {"lat": lat, "long": lon, "number": "1", "ashrae_version": version})
+    data     = _get("/request_places.php", {"lat": lat, "long": lon, "number": "1", "ashrae_version": version})
     if "_error" in data:
         return data
     stations = data.get("meteo_stations", [])
@@ -98,7 +90,7 @@ def find_station(lat: float, lon: float, version: str = "2021") -> dict:
 
 
 def fetch_climate(wmo: str, version: str = "2021") -> dict:
-    data     = _post(METEO_URL, {"wmo": wmo, "ashrae_version": version, "si_ip": "SI"})
+    data     = _get("/request_meteo_parametres.php", {"wmo": wmo, "ashrae_version": version, "si_ip": "SI"})
     if "_error" in data:
         return data
     stations = data.get("meteo_stations", [])
