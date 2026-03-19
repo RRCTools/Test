@@ -36,15 +36,16 @@ MONTHLY_2  = [f"monthly_design_day_cooling_DB_range_{m}_DB_2"  for m in MONTHS]
 
 # Rows shown in the results table
 # (display label, api_field_or_computed_key, unit)
+# Rows shown in results table — ordered to match ASHRAE output screenshot
 DISPLAY_ROWS = [
-    ("Highest Monthly 0.4%",    "_monthly_04_max",                                           "°C"),
-    ("Highest Monthly 2.0%",    "_monthly_2_max",                                            "°C"),
-    ("Yearly 0.4%",             "cooling_DB_MCWB_04_DB",                                    "°C"),
-    ("Yearly 2.0%",             "cooling_DB_MCWB_2_DB",                                     "°C"),
-    ("Extreme Mean Annual Max", "n-year_return_period_values_of_extreme_DB_50_max",          "°C"),
-    ("Extreme Mean Annual Min", "n-year_return_period_values_of_extreme_DB_50_min",          "°C"),
+    # label                       api field / computed key                                    unit
+    ("Highest Monthly 0.4%",    "_monthly_04_max",                                           "°C"),  # max of 12 monthly 0.4% DB cols (green boxes in screenshot)
+    ("Yearly 0.4%",             "cooling_DB_MCWB_04_DB",                                    "°C"),  # annual cooling 0.4% DB
+    ("Yearly 2.0%",             "cooling_DB_MCWB_2_DB",                                     "°C"),  # annual cooling 2.0% DB
+    ("Extreme Mean Annual Max", "n-year_return_period_values_of_extreme_DB_50_max",          "°C"),  # n=50 years Mean Max
+    ("Extreme Mean Annual Min", "n-year_return_period_values_of_extreme_DB_50_min",          "°C"),  # n=50 years Mean Min
+    ("Max Recorded Temp (N=50)","n-year_return_period_values_of_extreme_DB_50_max",          "°C"),  # red box in screenshot = 46.9°C
     ("Min Recorded Temp (N=50)","n-year_return_period_values_of_extreme_DB_50_min",          "°C"),
-    ("Max Recorded Temp (N=50)","n-year_return_period_values_of_extreme_DB_50_max",          "°C"),
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -131,37 +132,44 @@ def render_ashrae_page():
     # ── Location inputs ──────────────────────────────────────────────────────
     st.markdown("#### 📍 Project Locations")
 
-    if "ashrae_locs" not in st.session_state:
-        st.session_state.ashrae_locs = [{"name": "Location A", "lat": "", "lon": ""}]
+    # ── Initialise widget keys in session state on first load ──
+    if "ashrae_num_locs" not in st.session_state:
+        st.session_state.ashrae_num_locs = 1
+        st.session_state["ashrae_la_0"] = ""
+        st.session_state["ashrae_lo_0"] = ""
 
-    locs      = st.session_state.ashrae_locs
+    num   = st.session_state.ashrae_num_locs
     to_delete = None
 
     # Header row
-    h1, h2, h3, _ = st.columns([2, 2, 2, 0.5])
-    h1.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LOCATION NAME</span>", unsafe_allow_html=True)
-    h2.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LATITUDE (°N)</span>",  unsafe_allow_html=True)
-    h3.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LONGITUDE (°E / °W negative)</span>", unsafe_allow_html=True)
+    h1, h2, _ = st.columns([3, 3, 0.5])
+    h1.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LATITUDE (°N)</span>",  unsafe_allow_html=True)
+    h2.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LONGITUDE (°E / °W negative)</span>", unsafe_allow_html=True)
 
-    for i, loc in enumerate(locs):
-        c1, c2, c3, c4 = st.columns([2, 2, 2, 0.5])
-        locs[i]["name"] = c1.text_input("n", value=loc["name"], key=f"n_{i}",  label_visibility="collapsed")
-        locs[i]["lat"]  = c2.text_input("la", value=loc["lat"],  key=f"la_{i}", label_visibility="collapsed", placeholder="e.g. 45.60")
-        locs[i]["lon"]  = c3.text_input("lo", value=loc["lon"],  key=f"lo_{i}", label_visibility="collapsed", placeholder="e.g. -121.50")
-        if len(locs) > 1:
-            if c4.button("✕", key=f"del_{i}"):
+    for i in range(num):
+        c1, c2, c3 = st.columns([3, 3, 0.5])
+        c1.text_input("lat",   key=f"ashrae_la_{i}", label_visibility="collapsed", placeholder="e.g. 45.60")
+        c2.text_input("lon",   key=f"ashrae_lo_{i}", label_visibility="collapsed", placeholder="e.g. -121.50")
+        if num > 1:
+            if c3.button("✕", key=f"ashrae_del_{i}"):
                 to_delete = i
 
     if to_delete is not None:
-        st.session_state.ashrae_locs.pop(to_delete)
+        for i in range(to_delete, num - 1):
+            st.session_state[f"ashrae_la_{i}"] = st.session_state.get(f"ashrae_la_{i+1}", "")
+            st.session_state[f"ashrae_lo_{i}"] = st.session_state.get(f"ashrae_lo_{i+1}", "")
+        st.session_state[f"ashrae_la_{num-1}"] = ""
+        st.session_state[f"ashrae_lo_{num-1}"] = ""
+        st.session_state.ashrae_num_locs -= 1
         st.rerun()
 
     ca, cb = st.columns([1, 3])
     with ca:
-        if len(locs) < 5 and st.button("＋ Add Location"):
-            st.session_state.ashrae_locs.append(
-                {"name": f"Location {chr(65 + len(locs))}", "lat": "", "lon": ""}
-            )
+        if num < 5 and st.button("＋ Add Location"):
+            new_i = num
+            st.session_state[f"ashrae_la_{new_i}"] = ""
+            st.session_state[f"ashrae_lo_{new_i}"] = ""
+            st.session_state.ashrae_num_locs += 1
             st.rerun()
     with cb:
         run = st.button("▶  Fetch ASHRAE Data", type="primary", use_container_width=True)
@@ -181,18 +189,17 @@ def render_ashrae_page():
         )
         return
 
-    # ── Validate ─────────────────────────────────────────────────────────────
+    # ── Validate — read directly from widget session-state keys ─────────────
     valid = []
-    for loc in locs:
+    for i in range(num):
+        label = f"Site {chr(65+i)}"
+        lat_s = st.session_state.get(f"ashrae_la_{i}", "").strip()
+        lon_s = st.session_state.get(f"ashrae_lo_{i}", "").strip()
         try:
-            valid.append({
-                "name": loc["name"].strip() or "Unnamed",
-                "lat":  float(loc["lat"]),
-                "lon":  float(loc["lon"]),
-            })
+            valid.append({"name": label, "lat": float(lat_s), "lon": float(lon_s)})
         except Exception:
-            if loc["lat"] or loc["lon"]:
-                st.warning(f"⚠️ '{loc['name']}' skipped — enter valid decimal coordinates.")
+            if lat_s or lon_s:
+                st.warning(f"⚠️ {label} skipped — enter valid decimal coordinates (e.g. 45.60, -121.50).")
 
     if not valid:
         st.error("No valid locations. Enter lat/lon as decimal degrees (e.g. 45.6, -121.5).")
