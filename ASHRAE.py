@@ -24,8 +24,9 @@ import pandas as pd
 
 # ── API constants ─────────────────────────────────────────────────────────────
 
-STATION_URL = "http://ashrae-meteo.info/request_places.php"
-METEO_URL   = "http://ashrae-meteo.info/request_meteo_parametres.php"
+# Streamlit Cloud blocks outbound HTTP — route through HTTPS proxy
+STATION_URL = "https://corsproxy.io/?url=http://ashrae-meteo.info/request_places.php"
+METEO_URL   = "https://corsproxy.io/?url=http://ashrae-meteo.info/request_meteo_parametres.php"
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -49,12 +50,42 @@ DISPLAY_ROWS = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _post(url: str, params: dict) -> dict:
+    """
+    POST to ashrae-meteo.info via corsproxy.io.
+    corsproxy.io forwards POST body correctly when Content-Type is set.
+    Falls back to GET with query params if POST fails.
+    """
     try:
-        resp = requests.post(url, data=params, timeout=15)
-        raw  = resp.content.decode("utf-8-sig").strip()
-        return json.loads(raw)
-    except Exception as e:
-        return {"_error": str(e)}
+        # Try POST first (corsproxy forwards body + headers)
+        resp = requests.post(
+            url,
+            data=params,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=20,
+        )
+        raw = resp.content.decode("utf-8-sig").strip()
+        if raw and raw[0] in ("{", "["):
+            return json.loads(raw)
+        raise ValueError(f"Non-JSON response: {raw[:120]}")
+    except Exception as e_post:
+        # Fallback: GET with query params appended to URL
+        try:
+            import urllib.parse
+            qs  = urllib.parse.urlencode(params)
+            # For corsproxy, append params to the proxied URL before encoding
+            base_url = url  # already includes ?url=http://...
+            # Extract the inner URL and append params
+            if "?url=" in url:
+                proxy_prefix, inner = url.split("?url=", 1)
+                inner_with_params = inner + ("&" if "?" in inner else "?") + qs
+                get_url = proxy_prefix + "?url=" + urllib.parse.quote(inner_with_params, safe="")
+            else:
+                get_url = url + ("&" if "?" in url else "?") + qs
+            resp2 = requests.get(get_url, timeout=20)
+            raw2  = resp2.content.decode("utf-8-sig").strip()
+            return json.loads(raw2)
+        except Exception as e_get:
+            return {"_error": f"POST failed: {e_post} | GET fallback failed: {e_get}"}
 
 
 def find_station(lat: float, lon: float, version: str = "2021") -> dict:
