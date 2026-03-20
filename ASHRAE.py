@@ -1,376 +1,235 @@
 """
-ASHRAE Design Temperature Lookup
-─────────────────────────────────────────────────────────────────────────────
-Standalone Streamlit page.  Run: streamlit run ashrae_page.py
-Or integrate: call render_ashrae_page() inside your main app.py nav block.
-─────────────────────────────────────────────────────────────────────────────
-API:  http://ashrae-meteo.info
-  Step 1 — POST request_places.php          → nearest WMO station from lat/lon
-  Step 2 — POST request_meteo_parametres.php → full climate data for that WMO
+PDF & Image Merger
+──────────────────
+Standalone Streamlit page.
+Run: streamlit run pdf_merger.py
 
-Key fields used (ASHRAE 2021, SI units):
-  cooling_DB_MCWB_04_DB                              = Yearly cooling 0.4% DB
-  cooling_DB_MCWB_2_DB                               = Yearly cooling 2.0% DB
-  monthly_design_day_cooling_DB_range_<Mon>_DB_04    = Monthly 0.4% (x12)
-  monthly_design_day_cooling_DB_range_<Mon>_DB_2     = Monthly 2.0% (x12)
-  n-year_return_period_values_of_extreme_DB_50_max   = Extreme annual max N=50
-  n-year_return_period_values_of_extreme_DB_50_min   = Extreme annual min N=50
+Accepts: .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .webp
+Converts images to PDF pages then merges everything in order.
 """
 
 import streamlit as st
-import requests
-import json
-import pandas as pd
+import io
+from PIL import Image
+from pypdf import PdfWriter, PdfReader
 
-# ── API constants ─────────────────────────────────────────────────────────────
-
-# Streamlit Cloud blocks outbound HTTP — route all calls through HTTPS proxy as GET requests
-# ashrae-meteo.info accepts GET params for all endpoints
-ASHRAE_BASE  = "http://ashrae-meteo.info"
-PROXY_PREFIX = "https://corsproxy.io/?url="
-PROXY_BACKUP = "https://api.allorigins.win/raw?url="
-
-MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-MONTHLY_04 = [f"monthly_design_day_cooling_DB_range_{m}_DB_04" for m in MONTHS]
-MONTHLY_2  = [f"monthly_design_day_cooling_DB_range_{m}_DB_2"  for m in MONTHS]
-
-# Rows shown in the results table
-# (display label, api_field_or_computed_key, unit)
-# Rows shown in results table — ordered to match ASHRAE output screenshot
-DISPLAY_ROWS = [
-    # label                       api field / computed key                                    unit
-    ("Highest Monthly 0.4%",    "_monthly_04_max",                                           "°C"),  # max of 12 monthly 0.4% DB cols (green boxes in screenshot)
-    ("Yearly 0.4%",             "cooling_DB_MCWB_04_DB",                                    "°C"),  # annual cooling 0.4% DB
-    ("Yearly 2.0%",             "cooling_DB_MCWB_2_DB",                                     "°C"),  # annual cooling 2.0% DB
-    ("Extreme Mean Annual Max", "n-year_return_period_values_of_extreme_DB_50_max",          "°C"),  # n=50 years Mean Max
-    ("Extreme Mean Annual Min", "n-year_return_period_values_of_extreme_DB_50_min",          "°C"),  # n=50 years Mean Min
-    ("Max Recorded Temp (N=50)","n-year_return_period_values_of_extreme_DB_50_max",          "°C"),  # red box in screenshot = 46.9°C
-    ("Min Recorded Temp (N=50)","n-year_return_period_values_of_extreme_DB_50_min",          "°C"),
-]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get(endpoint: str, params: dict) -> dict:
+def image_to_pdf_bytes(img_bytes: bytes, filename: str) -> bytes:
+    """Convert an image file to a single-page PDF in memory."""
+    img = Image.open(io.BytesIO(img_bytes))
+    # Convert to RGB (removes alpha channel which PDF doesn't support)
+    if img.mode in ("RGBA", "P", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    pdf_buf = io.BytesIO()
+    img.save(pdf_buf, format="PDF", resolution=150)
+    return pdf_buf.getvalue()
+
+
+def merge_files(file_list: list) -> bytes:
     """
-    GET from ashrae-meteo.info via HTTPS proxy.
-    Builds: PROXY_PREFIX + url_encode(ASHRAE_BASE + endpoint + ?params)
-    Falls back to allorigins if corsproxy fails.
+    Merge a list of (name, bytes, type) tuples into one PDF.
+    Returns the merged PDF as bytes.
     """
-    import urllib.parse
+    writer = PdfWriter()
 
-    target = ASHRAE_BASE + endpoint + "?" + urllib.parse.urlencode(params)
-    
-    for proxy in [PROXY_PREFIX, PROXY_BACKUP]:
-        try:
-            url  = proxy + urllib.parse.quote(target, safe="")
-            resp = requests.get(url, timeout=20, headers={"Accept": "application/json"})
-            raw  = resp.content.decode("utf-8-sig").strip()
-            if not raw:
-                continue
-            data = json.loads(raw)
-            # allorigins wraps in {"contents": "..."} — unwrap if needed
-            if "contents" in data and isinstance(data["contents"], str):
-                data = json.loads(data["contents"])
-            return data
-        except Exception as e:
-            last_err = str(e)
-            continue
+    for name, data, ftype in file_list:
+        if ftype == "pdf":
+            reader = PdfReader(io.BytesIO(data))
+            for page in reader.pages:
+                writer.add_page(page)
+        else:  # image
+            pdf_bytes = image_to_pdf_bytes(data, name)
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            writer.add_page(reader.pages[0])
 
-    return {"_error": f"Both proxies failed. Last error: {last_err}"}
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-def find_station(lat: float, lon: float, version: str = "2021") -> dict:
-    data     = _get("/request_places.php", {"lat": lat, "long": lon, "number": "1", "ashrae_version": version})
-    if "_error" in data:
-        return data
-    stations = data.get("meteo_stations", [])
-    return stations[0] if stations else {"_error": "No station found near these coordinates"}
+def file_type(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower()
+    return "pdf" if ext == "pdf" else "image"
 
 
-def fetch_climate(wmo: str, version: str = "2021") -> dict:
-    data     = _get("/request_meteo_parametres.php", {"wmo": wmo, "ashrae_version": version, "si_ip": "SI"})
-    if "_error" in data:
-        return data
-    stations = data.get("meteo_stations", [])
-    return stations[0] if stations else {"_error": f"No climate data for WMO {wmo}"}
-
-
-def to_float(val) -> float | None:
-    try:
-        return float(str(val).strip())
-    except Exception:
-        return None
-
-
-def monthly_max(climate: dict, fields: list) -> float | None:
-    vals = [to_float(climate.get(f)) for f in fields]
-    vals = [v for v in vals if v is not None]
-    return round(max(vals), 1) if vals else None
+def page_count(data: bytes, ftype: str) -> int:
+    if ftype == "pdf":
+        return len(PdfReader(io.BytesIO(data)).pages)
+    return 1
 
 
 # ── Page ──────────────────────────────────────────────────────────────────────
 
-def render_ashrae_page():
-    st.markdown("### 🌡️ ASHRAE Design Temperature Lookup")
+def render_merger_page():
+    st.markdown("### 📎 PDF & Image Merger")
     st.markdown(
         "<p style='color:#8b949e; margin-bottom:24px;'>"
-        "Enter coordinates for up to 5 project locations. Fetches ASHRAE 2021 climatic design "
-        "conditions and recommends the worst-case inverter design temperature.</p>",
+        "Upload PDFs and images in any order. Drag to reorder, then download the merged PDF.</p>",
         unsafe_allow_html=True,
     )
 
-    # ── Location inputs ──────────────────────────────────────────────────────
-    st.markdown("#### 📍 Project Locations")
+    # ── Init state ────────────────────────────────────────────────────────────
+    if "merger_files" not in st.session_state:
+        st.session_state.merger_files = []   # list of {name, data, ftype, pages}
 
-    # ── Initialise widget keys in session state on first load ──
-    if "ashrae_num_locs" not in st.session_state:
-        st.session_state.ashrae_num_locs = 1
-        st.session_state["ashrae_la_0"] = ""
-        st.session_state["ashrae_lo_0"] = ""
+    files = st.session_state.merger_files
 
-    num   = st.session_state.ashrae_num_locs
-    to_delete = None
+    # ── Upload section ────────────────────────────────────────────────────────
+    st.markdown("#### ＋ Add Files")
 
-    # Header row
-    h1, h2, _ = st.columns([3, 3, 0.5])
-    h1.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LATITUDE (°N)</span>",  unsafe_allow_html=True)
-    h2.markdown("<span style='color:#8b949e; font-size:0.78rem;'>LONGITUDE (°E / °W negative)</span>", unsafe_allow_html=True)
+    uploaded = st.file_uploader(
+        "Upload PDFs or images",
+        type=["pdf", "png", "jpg", "jpeg", "tiff", "bmp", "webp"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        help="Add as many files as you like — each click adds to the list",
+    )
 
-    for i in range(num):
-        c1, c2, c3 = st.columns([3, 3, 0.5])
-        c1.text_input("lat",   key=f"ashrae_la_{i}", label_visibility="collapsed", placeholder="e.g. 45.60")
-        c2.text_input("lon",   key=f"ashrae_lo_{i}", label_visibility="collapsed", placeholder="e.g. -121.50")
-        if num > 1:
-            if c3.button("✕", key=f"ashrae_del_{i}"):
-                to_delete = i
-
-    if to_delete is not None:
-        for i in range(to_delete, num - 1):
-            st.session_state[f"ashrae_la_{i}"] = st.session_state.get(f"ashrae_la_{i+1}", "")
-            st.session_state[f"ashrae_lo_{i}"] = st.session_state.get(f"ashrae_lo_{i+1}", "")
-        st.session_state[f"ashrae_la_{num-1}"] = ""
-        st.session_state[f"ashrae_lo_{num-1}"] = ""
-        st.session_state.ashrae_num_locs -= 1
-        st.rerun()
-
-    ca, cb = st.columns([1, 3])
-    with ca:
-        if num < 5 and st.button("＋ Add Location"):
-            new_i = num
-            st.session_state[f"ashrae_la_{new_i}"] = ""
-            st.session_state[f"ashrae_lo_{new_i}"] = ""
-            st.session_state.ashrae_num_locs += 1
+    if uploaded:
+        existing_names = {f["name"] for f in files}
+        added = 0
+        for uf in uploaded:
+            if uf.name not in existing_names:
+                data  = uf.read()
+                ftype = file_type(uf.name)
+                try:
+                    pages = page_count(data, ftype)
+                except Exception:
+                    pages = 1
+                files.append({"name": uf.name, "data": data, "ftype": ftype, "pages": pages})
+                existing_names.add(uf.name)
+                added += 1
+        if added:
+            st.session_state.merger_files = files
             st.rerun()
-    with cb:
-        run = st.button("▶  Fetch ASHRAE Data", type="primary", use_container_width=True)
 
     st.markdown("<hr style='border-color:#21262d; margin:20px 0;'>", unsafe_allow_html=True)
 
-    if not run:
+    # ── File list ─────────────────────────────────────────────────────────────
+    if not files:
         st.markdown(
-            "<div style='background:#161b22; border:1px solid #21262d; border-radius:8px; "
-            "padding:16px 20px; color:#8b949e; font-size:0.85rem; line-height:1.8;'>"
-            "Enter project coordinates and click <b style='color:#e85d04;'>▶ Fetch ASHRAE Data</b>.<br>"
-            "Data source: "
-            "<a href='https://ashrae-meteo.info/v3.0/' target='_blank' style='color:#58a6ff;'>"
-            "ashrae-meteo.info</a> · ASHRAE 2021 Handbook of Fundamentals"
+            "<div style='background:#161b22; border:1px dashed #30363d; border-radius:8px; "
+            "padding:40px; text-align:center; color:#8b949e;'>"
+            "No files added yet — use the uploader above to add PDFs or images."
             "</div>",
             unsafe_allow_html=True,
         )
         return
 
-    # ── Validate — read directly from widget session-state keys ─────────────
-    valid = []
-    for i in range(num):
-        label = f"Site {chr(65+i)}"
-        lat_s = st.session_state.get(f"ashrae_la_{i}", "").strip()
-        lon_s = st.session_state.get(f"ashrae_lo_{i}", "").strip()
-        try:
-            valid.append({"name": label, "lat": float(lat_s), "lon": float(lon_s)})
-        except Exception:
-            if lat_s or lon_s:
-                st.warning(f"⚠️ {label} skipped — enter valid decimal coordinates (e.g. 45.60, -121.50).")
+    total_pages = sum(f["pages"] for f in files)
+    st.markdown(
+        f"#### 📋 Files to Merge "
+        f"<span style='color:#8b949e; font-size:0.85rem; font-weight:400;'>"
+        f"— {len(files)} file{'s' if len(files)!=1 else ''} · {total_pages} page{'s' if total_pages!=1 else ''} total"
+        f"</span>",
+        unsafe_allow_html=True,
+    )
 
-    if not valid:
-        st.error("No valid locations. Enter lat/lon as decimal degrees (e.g. 45.6, -121.5).")
-        return
+    to_delete = None
+    move_up   = None
+    move_down = None
 
-    # ── Fetch ─────────────────────────────────────────────────────────────────
-    results = []
-    prog    = st.progress(0, text="Connecting to ASHRAE database…")
+    for i, f in enumerate(files):
+        is_pdf = f["ftype"] == "pdf"
+        icon   = "📄" if is_pdf else "🖼️"
+        pg_txt = f"{f['pages']} page{'s' if f['pages']!=1 else ''}" if is_pdf else "1 page (image)"
 
-    for i, loc in enumerate(valid):
-        prog.progress(i / len(valid), text=f"Fetching {loc['name']}…")
+        col_num, col_icon, col_name, col_pages, col_up, col_dn, col_del = st.columns(
+            [0.4, 0.4, 5, 1.5, 0.5, 0.5, 0.5]
+        )
 
-        station = find_station(loc["lat"], loc["lon"])
-        if "_error" in station:
-            results.append({"name": loc["name"], "error": station["_error"]})
-            continue
-
-        wmo    = station.get("wmo", "")
-        s_name = station.get("place_name", "")
-        s_ctry = station.get("country", "")
-        s_dist = station.get("distance", "?")
-
-        climate = fetch_climate(wmo)
-        if "_error" in climate:
-            results.append({"name": loc["name"], "wmo": wmo, "station": s_name,
-                             "error": climate["_error"]})
-            continue
-
-        # Inject computed fields
-        climate["_monthly_04_max"] = monthly_max(climate, MONTHLY_04)
-        climate["_monthly_2_max"]  = monthly_max(climate, MONTHLY_2)
-
-        row = {
-            "name":    loc["name"],
-            "station": f"{s_name}, {s_ctry}",
-            "wmo":     wmo,
-            "dist_km": s_dist,
-            "error":   None,
-            "_raw":    climate,
-        }
-        for label, field, _ in DISPLAY_ROWS:
-            row[label] = to_float(climate.get(field))
-
-        results.append(row)
-
-    prog.progress(1.0, text="Done!")
-    prog.empty()
-
-    # ── Render ────────────────────────────────────────────────────────────────
-    ok  = [r for r in results if not r.get("error")]
-    bad = [r for r in results if r.get("error")]
-
-    for r in bad:
-        st.error(f"❌ **{r['name']}**: {r['error']}")
-
-    if not ok:
-        return
-
-    # Station cards
-    st.markdown("#### 📡 Nearest ASHRAE 2021 Stations")
-    cols = st.columns(len(ok))
-    for col, r in zip(cols, ok):
-        col.markdown(
-            f"<div style='background:#161b22; border:1px solid #21262d; border-radius:8px; padding:12px;'>"
-            f"<div style='color:#e85d04; font-weight:600; font-size:0.95rem;'>{r['name']}</div>"
-            f"<div style='color:#c9d1d9; font-size:0.8rem; margin-top:4px;'>{r['station']}</div>"
-            f"<div style='color:#8b949e; font-size:0.75rem; margin-top:2px;'>WMO {r['wmo']} · {r['dist_km']} km away</div>"
-            f"</div>",
+        col_num.markdown(
+            f"<div style='color:#8b949e; font-size:0.85rem; padding-top:8px; text-align:center;'>{i+1}</div>",
+            unsafe_allow_html=True,
+        )
+        col_icon.markdown(
+            f"<div style='font-size:1.2rem; padding-top:4px; text-align:center;'>{icon}</div>",
+            unsafe_allow_html=True,
+        )
+        col_name.markdown(
+            f"<div style='background:#161b22; border:1px solid #21262d; border-radius:6px; "
+            f"padding:8px 12px; color:#c9d1d9; font-size:0.85rem; "
+            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
+            f"{f['name']}</div>",
+            unsafe_allow_html=True,
+        )
+        col_pages.markdown(
+            f"<div style='color:#8b949e; font-size:0.78rem; padding-top:10px;'>{pg_txt}</div>",
             unsafe_allow_html=True,
         )
 
-    st.markdown("<br>", unsafe_allow_html=True)
+        if i > 0 and col_up.button("↑", key=f"up_{i}", help="Move up"):
+            move_up = i
+        if i < len(files) - 1 and col_dn.button("↓", key=f"dn_{i}", help="Move down"):
+            move_down = i
+        if col_del.button("✕", key=f"del_{i}", help="Remove"):
+            to_delete = i
 
-    # Results table
-    st.markdown("#### 📊 Design Temperatures (°C) — ASHRAE 2021")
-
-    table = {"Parameter": [lbl for lbl, _, _ in DISPLAY_ROWS],
-             "Unit":      [u   for _, _, u  in DISPLAY_ROWS]}
-    for r in ok:
-        table[r["name"]] = [
-            f"{r.get(lbl):.1f}" if r.get(lbl) is not None else "N/A"
-            for lbl, _, _ in DISPLAY_ROWS
-        ]
-
-    df = pd.DataFrame(table)
-
-    def highlight_hm04(row):
-        if row["Parameter"] == "Highest Monthly 0.4%":
-            return [f"background-color:rgba(232,93,4,0.12); font-weight:600"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(df.style.apply(highlight_hm04, axis=1),
-                 use_container_width=True, hide_index=True)
+    # Handle reorder / delete
+    if move_up is not None:
+        files[move_up - 1], files[move_up] = files[move_up], files[move_up - 1]
+        st.session_state.merger_files = files
+        st.rerun()
+    if move_down is not None:
+        files[move_down], files[move_down + 1] = files[move_down + 1], files[move_down]
+        st.session_state.merger_files = files
+        st.rerun()
+    if to_delete is not None:
+        files.pop(to_delete)
+        st.session_state.merger_files = files
+        st.rerun()
 
     st.markdown("<hr style='border-color:#21262d; margin:20px 0;'>", unsafe_allow_html=True)
 
-    # Recommendation
-    st.markdown("#### ✅ Inverter Design Temperature Recommendation")
+    # ── Clear all ─────────────────────────────────────────────────────────────
+    col_clear, col_merge = st.columns([1, 3])
+    with col_clear:
+        if st.button("🗑️ Clear All", use_container_width=True):
+            st.session_state.merger_files = []
+            st.rerun()
 
-    hm04 = {r["name"]: r.get("Highest Monthly 0.4%")
-             for r in ok if r.get("Highest Monthly 0.4%") is not None}
-
-    if not hm04:
-        st.warning(
-            "⚠️ Monthly 0.4% temperatures could not be computed — "
-            "the monthly fields may use a different naming convention in ASHRAE 2021. "
-            "Expand the debug panel below to inspect available field names."
-        )
-    else:
-        worst_name = max(hm04, key=hm04.get)
-        worst_val  = hm04[worst_name]
-
-        st.markdown(
-            f"<div style='background:#161b22; border:2px solid #e85d04; border-radius:10px; padding:20px 24px;'>"
-            f"<div style='color:#8b949e; font-size:0.75rem; text-transform:uppercase; "
-            f"letter-spacing:0.06em; margin-bottom:10px;'>"
-            f"Recommended inverter design temperature · ASHRAE 2021 · Highest Monthly 0.4%</div>"
-            f"<div style='display:flex; align-items:baseline; gap:24px; flex-wrap:wrap;'>"
-            f"<div><span style='color:#8b949e; font-size:0.85rem;'>Worst-case location: </span>"
-            f"<span style='color:#e85d04; font-size:1.1rem; font-weight:600;'>{worst_name}</span></div>"
-            f"<div><span style='color:#8b949e; font-size:0.85rem;'>Design temp: </span>"
-            f"<span style='color:#c9d1d9; font-size:1.8rem; font-weight:600;'>{worst_val:.1f} °C</span></div>"
-            f"</div>"
-            f"<div style='color:#8b949e; font-size:0.78rem; margin-top:12px; line-height:1.7;'>"
-            f"The <b style='color:#c9d1d9;'>Highest Monthly 0.4%</b> dry-bulb temperature is exceeded "
-            f"only 0.4% of hours in the hottest month (~3 hrs/month). "
-            f"This is the RRC standard basis for inverter thermal derating analysis per ASHRAE guidelines."
-            f"</div></div>",
-            unsafe_allow_html=True,
-        )
-
-        if len(hm04) > 1:
-            st.markdown("<br>", unsafe_allow_html=True)
-            for name, val in sorted(hm04.items(), key=lambda x: -x[1]):
-                is_worst = name == worst_name
-                color    = "#e85d04" if is_worst else "#4a90c4"
-                pct      = int(val / (worst_val + 8) * 100)
-                tag      = "  ← worst case" if is_worst else ""
-                st.markdown(
-                    f"<div style='margin-bottom:10px;'>"
-                    f"<div style='display:flex; justify-content:space-between; margin-bottom:4px;'>"
-                    f"<span style='color:#c9d1d9; font-size:0.85rem;'>{name}{tag}</span>"
-                    f"<span style='color:{color}; font-weight:600;'>{val:.1f} °C</span></div>"
-                    f"<div style='background:#21262d; border-radius:4px; height:8px;'>"
-                    f"<div style='background:{color}; width:{pct}%; height:8px; border-radius:4px;'></div>"
-                    f"</div></div>",
-                    unsafe_allow_html=True,
-                )
-
-    # Debug expander
-    with st.expander("🔍 Raw API response (debug / field name verification)"):
-        st.markdown(
-            "<p style='color:#8b949e; font-size:0.8rem;'>"
-            "All temperature-related fields returned by the API. "
-            "Use this to verify field names if any values show as N/A.</p>",
-            unsafe_allow_html=True,
-        )
-        for r in ok:
-            st.markdown(f"**{r['name']}** — {r['station']} (WMO {r['wmo']})")
-            raw = r.get("_raw", {})
-            temp_fields = {
-                k: v for k, v in raw.items()
-                if any(x in k.lower() for x in ["db", "cool", "heat", "extreme", "monthly", "temp"])
-                   and not k.startswith("_")
-            }
-            st.json(temp_fields)
+    # ── Merge & download ──────────────────────────────────────────────────────
+    with col_merge:
+        if st.button("⬇️  Merge & Download PDF", type="primary", use_container_width=True):
+            with st.spinner("Merging files…"):
+                try:
+                    merged = merge_files(
+                        [(f["name"], f["data"], f["ftype"]) for f in files]
+                    )
+                    st.success(f"✅ Merged {len(files)} files into {total_pages} pages.")
+                    st.download_button(
+                        label="📥 Download merged.pdf",
+                        data=merged,
+                        file_name="merged.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Merge failed: {e}")
 
 
-# ── Standalone entry point ────────────────────────────────────────────────────
+# ── Standalone entry ──────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     st.set_page_config(
-        page_title="ASHRAE Lookup · RRC",
+        page_title="PDF Merger · RRC",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
     st.markdown("""<style>
     [data-testid="stAppViewContainer"] { background: #0d1117; }
     [data-testid="stSidebar"] { background: #161b22; }
-    .stButton > button { border: 1px solid #e85d04; color: #e85d04; }
+    .stButton > button { border: 1px solid #30363d; color: #c9d1d9; }
     .stButton > button[kind="primary"] { background: #e85d04; color: white; border: none; }
+    .stDownloadButton > button { background: #1f6feb; color: white; border: none; }
     </style>""", unsafe_allow_html=True)
-    render_ashrae_page()
+    render_merger_page()
