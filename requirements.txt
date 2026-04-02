@@ -5,3 +5,5 @@ xlrd
 pdfplumber
 pypdf
 pillow
+plotly
+numpy
