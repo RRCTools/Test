@@ -110,7 +110,7 @@ def size_bess(poi_mw, poi_mwh, target_pf,
               inv_mva, pcs_pf, base_units, batt_mwh_dc, aux_kw_per_blk,
               eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
               eta_dc, eta_chg, eta_aux,
-              project_years, aug_year, aug_units_bol,
+              project_years, aug_year,
               soh_curve, cap_mvar=0.):
 
     # Full loss chain
@@ -133,45 +133,33 @@ def size_bess(poi_mw, poi_mwh, target_pf,
         n = n_new
     n_power = n
 
-    # ── ENERGY constraint for BASE blocks ────────────────────────────────────
+    # ── ENERGY constraint ─────────────────────────────────────────────────────
+    # aug_year=0  → no augmentation: base must sustain target for FULL project life
+    #               n_energy = ceil(mwh / (blk_mwh * SOH[project_years]))
+    # aug_year>0  → base must sustain target only UNTIL aug_year
+    #               n_energy = ceil(mwh / (blk_mwh * SOH[aug_year]))
     if aug_year > 0:
-        soh_aug     = soh[min(aug_year, len(soh)-1)]
-        n_energy    = ceil(poi_mwh / (blk_mwh_base * soh_aug))
+        soh_aug  = soh[min(aug_year, len(soh)-1)]
     else:
-        n_energy    = ceil(poi_mwh / blk_mwh_base)
-        soh_aug     = 1.0
+        soh_aug  = soh[min(project_years, len(soh)-1)]   # EOL SOH
+    n_energy = ceil(poi_mwh / (blk_mwh_base * soh_aug))
 
     n_base = max(n_power, n_energy)
 
-    # ── AUGMENTATION blocks ───────────────────────────────────────────────────
+    # ── AUGMENTATION blocks (NEW PCS+batteries added at aug_year) ─────────────
+    # Aug blocks are NOT pre-installed. They are completely new units added at aug_year.
+    # Base PCS stay constant; aug_year just adds more PCS+battery capacity.
     if aug_year > 0:
-        blk_mwh_aug_bol = aug_units_bol  * batt_mwh_dc * eta_all
-        blk_mwh_aug_full= base_units     * batt_mwh_dc * eta_all  # when fully loaded
-        e_base_at_aug   = n_base * blk_mwh_base * soh_aug
-        e_aug_partial   = 0.   # we place aug blocks at BOL with partial batteries
-        # How many aug blocks needed so that at aug_year, base+aug_partial >= target?
-        # (aug blocks also degrade from BOL to aug_year)
-        aug_needed_mwh  = poi_mwh - e_base_at_aug
-        if aug_needed_mwh > 0 and blk_mwh_aug_bol > 0:
-            # Each aug block contributes aug_bol energy degraded to aug_year
-            e_per_aug_block_at_aug = blk_mwh_aug_bol * soh_aug
-            n_aug = ceil(aug_needed_mwh / e_per_aug_block_at_aug)
-        else:
-            n_aug = 0
-        # Batteries added at augmentation: fill aug blocks from aug_units_bol → base_units
-        batt_added_per_aug_blk = base_units - aug_units_bol
-        n_batt_added_at_aug    = n_aug * batt_added_per_aug_blk
+        e_base_at_aug  = n_base * blk_mwh_base * soh_aug
+        aug_needed_mwh = max(poi_mwh - e_base_at_aug, 0.)
+        n_aug          = ceil(aug_needed_mwh / blk_mwh_base) if aug_needed_mwh > 0 else 0
     else:
-        n_aug = 0; aug_units_bol_eff = base_units
-        batt_added_per_aug_blk = 0; n_batt_added_at_aug = 0
+        n_aug = 0
 
-    # ALL PCS installed from day 1 (for power/reactive)
-    n_pcs_total = n_base + n_aug
-
-    # BOL batteries
-    n_batt_bol  = n_base * base_units + n_aug * aug_units_bol
-    # At aug year: add batteries to fill aug blocks
-    n_batt_aug  = n_batt_added_at_aug
+    # Power PCS = base only (aug PCS added later, not needed for day-1 power)
+    n_pcs_total = n_base          # only base PCS on day 1
+    n_batt_bol  = n_base * base_units
+    n_batt_aug  = n_aug  * base_units   # added at aug_year
 
     # ── Actual power cascade ──────────────────────────────────────────────────
     aux_mw_act = n_pcs_total * aux_kw_per_blk / 1000.
@@ -193,36 +181,43 @@ def size_bess(poi_mw, poi_mwh, target_pf,
     min_mpt_mva= s_mv_bus
 
     # ── Energy cascade @ BOL ─────────────────────────────────────────────────
-    e_dc_bol   = n_base*base_units*batt_mwh_dc + n_aug*aug_units_bol*batt_mwh_dc
+    e_dc_bol   = n_base * base_units * batt_mwh_dc
     e_poi_bol  = e_dc_bol * eta_all
 
     # ── Degradation schedule ──────────────────────────────────────────────────
     e_base_bol = n_base * blk_mwh_base
-    e_aug_partial_bol = n_aug * (aug_units_bol * batt_mwh_dc * eta_all)
-    # Aug block batteries added at aug_year = n_aug * (base_units-aug_units_bol) fresh
-    e_aug_new  = n_aug * (base_units-aug_units_bol) * batt_mwh_dc * eta_all if aug_year>0 else 0.
+    e_aug_bol  = n_aug  * blk_mwh_base   # aug fresh at aug_year
 
     deg = []
     for yr in range(project_years+1):
-        s_yr   = soh[min(yr,len(soh)-1)]
-        # Base energy degrades from yr 0
-        e_b    = e_base_bol * s_yr
-        # Aug partial (installed at BOL) also degrades from yr 0
-        e_ap   = e_aug_partial_bol * s_yr
-        # Aug new batteries added at aug_year, degrade from aug_year
-        if aug_year>0 and yr >= aug_year:
-            s_aug_rel = soh[min(yr-aug_year, len(soh)-1)]
-            e_an  = e_aug_new * s_aug_rel
+        s_yr = soh[min(yr, len(soh)-1)]
+        e_b  = e_base_bol * s_yr
+        if aug_year > 0 and yr >= aug_year:
+            s_rel = soh[min(yr-aug_year, len(soh)-1)]
+            e_aug = e_aug_bol * s_rel
         else:
-            e_an  = 0.
-        e_tot  = e_b + e_ap + e_an
-
-        aug_ev = e_an if (aug_year>0 and yr==aug_year) else 0.
+            e_aug = 0.
+        e_tot   = e_b + e_aug
+        aug_evt = round(e_aug_bol, 1) if (aug_year > 0 and yr == aug_year) else 0.
         deg.append({'Year':yr, 'SOH (%)':round(s_yr*100,2),
-                    'Base E@POI (MWh)':round(e_b+e_ap,1),
-                    'Aug E added (MWh)':round(aug_ev,1),
+                    'Base E@POI (MWh)':round(e_b,1),
+                    'Aug E added (MWh)':aug_evt,
                     'Total E@POI (MWh)':round(e_tot,1)})
     deg_df = pd.DataFrame(deg)
+
+    # ── 3 Checks (Excel R29-R31) ─────────────────────────────────────────────
+    q_poi_target    = poi_mw * np.tan(np.arccos(target_pf))
+    # Q available at MV bus from inverters (before MPT, after MVT+MV cable)
+    q_actual_mvbus  = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2, 0)) * eta_mvt * eta_mv + cap_mvar
+    # Q needed at MV bus: scale POI target by actual cascade ratio
+    q_needed_mvbus  = q_poi_target * (q_mpt_in / q_poi) if q_poi > 0.01 else q_poi_target / max(eta_mpt*eta_tx, 0.01)
+
+    # Overbuild: last year energy stays above target (aug_year=0 case)
+    overbuild_years = 0
+    for _yr in range(project_years+1):
+        if e_base_bol * soh[min(_yr, len(soh)-1)] >= poi_mwh:
+            overbuild_years = _yr
+    overbuild_pct   = (e_poi_bol - poi_mwh) / poi_mwh * 100
 
     # ── Cascade dict for SLD ──────────────────────────────────────────────────
     def pf_(p,q): return p/np.sqrt(p**2+q**2) if np.sqrt(p**2+q**2)>0 else 1.
@@ -237,7 +232,7 @@ def size_bess(poi_mw, poi_mwh, target_pf,
         # Quantities
         'n_base':n_base,'n_aug':n_aug,'n_pcs':n_pcs_total,
         'n_batt_bol':n_batt_bol,'n_batt_aug':n_batt_aug,
-        'base_units':base_units,'aug_units_bol':aug_units_bol,
+        'base_units':base_units,
         # Power
         'p_poi':p_poi,'q_poi':q_poi,'s_inv':s_inv_act,
         'min_mpt_mva':min_mpt_mva,'aux_mw':aux_mw_act,
@@ -246,10 +241,18 @@ def size_bess(poi_mw, poi_mwh, target_pf,
         'p_inv_nd':p_inv_nd,
         # Energy
         'e_poi_bol':e_poi_bol,'e_dc_bol':n_base*base_units*batt_mwh_dc+n_aug*aug_units_bol*batt_mwh_dc,
-        # Checks
+        # ── 3 Checks (Excel R29-R31) ─────────────────────────────────────
+        'check1_energy':   e_poi_bol >= poi_mwh * 0.999,
+        'check2_power':    p_poi >= poi_mw * 0.999,
+        'check3_reactive': q_actual_mvbus >= q_needed_mvbus * 0.999,
+        'q_actual_mvbus':  q_actual_mvbus,
+        'q_needed_mvbus':  q_needed_mvbus,
+        'q_poi_target':    q_poi_target,
+        'overbuild_pct':   overbuild_pct,
+        'overbuild_years': overbuild_years,
+        # Legacy
         'p_meets':p_poi>=poi_mw*.999,'e_meets':e_poi_bol>=poi_mwh*.999,
-        'q_meets':q_poi>=q_poi_need-.5,'q_poi_need':q_poi_need,
-        'overbuild_pct':(e_poi_bol-poi_mwh)/poi_mwh*100,
+        'q_meets':q_actual_mvbus>=q_needed_mvbus*.999,'q_poi_need':q_poi_target,
         # Drivers
         'n_power':n_power,'n_energy':n_energy,
         'blk_mwh_base':blk_mwh_base,'eta_all':eta_all,
@@ -277,12 +280,7 @@ with st.sidebar:
     st.markdown('<div class="sec">Augmentation</div>', unsafe_allow_html=True)
     aug_year = st.number_input("Augmentation Year (0=none)", value=5, min_value=0, max_value=40,
         help="Year when aug batteries are added. Base blocks sized to sustain until this year.")
-    if aug_year > 0:
-        aug_units_bol = st.number_input(
-            "Batteries pre-installed in aug blocks (at BOL)", value=2, min_value=0, max_value=20,
-            help="Aug PCS blocks are installed at BOL with this many batteries for partial energy. Rest added at aug_year.")
-    else:
-        aug_units_bol = 0
+    # aug blocks are fully new PCS+batteries added at aug_year (no partial pre-install)
 
     st.markdown('<div class="sec">Reactive Power</div>', unsafe_allow_html=True)
     pf_mode = st.radio("", ["Target PF","Target MVAR"], horizontal=True, label_visibility="collapsed")
@@ -382,30 +380,27 @@ if run_btn:
             inv_mva, pcs_pf, int(base_units), batt_mwh, aux_kw,
             eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
             eta_dc, eta_chg, eta_aux,
-            int(proj_yrs), int(aug_year), int(aug_units_bol),
+            int(proj_yrs), int(aug_year),
             soh_curve, float(cap_bank)
         )
 
     # ── Equipment quantities ─────────────────────────────────────────────────
     st.subheader("📦 Equipment Quantities")
 
-    # Base build
     st.markdown(f"""
     <div class="base-box">
     <b>🏗 BASE BUILD (Day 1)</b><br>
-    <b>{res['n_base']}</b> PCS blocks × {base_units} batteries = <b>{res['n_base']*int(base_units)}</b> battery units<br>
-    {"&nbsp;&nbsp;+ <b>"+str(res['n_aug'])+"</b> AUG PCS blocks × "+str(aug_units_bol)+" batteries pre-installed = <b>"+str(res['n_aug']*int(aug_units_bol))+"</b> battery units" if res['n_aug']>0 else ""}
-    {"<br>Total PCS @ BOL: <b>"+str(res['n_pcs'])+"</b> &nbsp;|&nbsp; Total batteries @ BOL: <b>"+str(res['n_batt_bol'])+"</b>" if res['n_aug']>0 else ""}
+    <b>{res['n_base']}</b> PCS blocks × {int(base_units)} batteries = <b>{res['n_batt_bol']}</b> battery units installed
     </div>
     """, unsafe_allow_html=True)
 
     if res['n_aug'] > 0:
         st.markdown(f"""
         <div class="aug-box">
-        <b>🔄 AUGMENTATION (Year {aug_year})</b><br>
-        Add <b>{int(base_units)-int(aug_units_bol)}</b> batteries to each of the {res['n_aug']} aug PCS blocks<br>
-        = <b>{res['n_batt_aug']}</b> batteries added at Year {aug_year}<br>
-        Total batteries after augmentation: <b>{res['n_batt_bol']+res['n_batt_aug']}</b>
+        <b>🔄 AUGMENTATION (Year {int(aug_year)})</b><br>
+        Add <b>{res['n_aug']}</b> new PCS blocks × {int(base_units)} batteries = <b>{res['n_batt_aug']}</b> batteries<br>
+        Total PCS after aug: <b>{res['n_base']+res['n_aug']}</b> &nbsp;|&nbsp;
+        Total batteries after aug: <b>{res['n_batt_bol']+res['n_batt_aug']}</b>
         </div>
         """, unsafe_allow_html=True)
 
@@ -423,15 +418,48 @@ if run_btn:
 
     # ── Checks ──────────────────────────────────────────────────────────────
     st.subheader("✅ Sizing Checks")
+
+    def check_card(col, num, title, ok, actual, required, note=""):
+        bg  = "#0d3321" if ok else "#3d1a1a"
+        brd = "#238636" if ok else "#b62324"
+        tc  = "#3fb950" if ok else "#f85149"
+        sym = "✓" if ok else "✗"
+        nh  = f'<div style="font-size:.70rem;color:#8b949e;margin-top:3px">{note}</div>' if note else ""
+        html = (
+            f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;padding:10px 12px;margin-bottom:4px">'
+            f'<div style="font-family:monospace;font-size:.65rem;color:#8b949e;letter-spacing:.1em">CHECK {num}</div>'
+            f'<div style="font-size:.92rem;font-weight:700;color:{tc}">{sym} {title}</div>'
+            f'<div style="font-size:.80rem;color:#c9d1d9">Actual: <b>{actual}</b></div>'
+            f'<div style="font-size:.80rem;color:#c9d1d9">Required: <b>{required}</b></div>'
+            f'{nh}</div>'
+        )
+        col.markdown(html, unsafe_allow_html=True)
+
     bc = st.columns(4)
-    def badge(col,ok,lbl,det):
-        cls="ok" if ok else "fail"; sym="✓" if ok else "✗"
-        col.markdown(f'<span class="{cls}">{sym} {lbl}</span><br><small style="color:#64748b">{det}</small>',unsafe_allow_html=True)
-    badge(bc[0],res['p_meets'],"Active Power",   f"{res['p_poi']:.1f} MW ≥ {poi_mw:.0f}")
-    badge(bc[1],res['e_meets'],"Energy @ BOL",   f"{res['e_poi_bol']:.1f} MWh ≥ {poi_mwh:.0f}")
-    badge(bc[2],res['q_meets'],"Reactive Power", f"{res['q_poi']:.1f} avail, {res['q_poi_need']:.1f} needed")
-    mpt_ok=n_mpt*s_mpt>=res['min_mpt_mva']
-    badge(bc[3],mpt_ok,"MPT Adequate",           f"{res['min_mpt_mva']:.1f} needed, {n_mpt*s_mpt:.0f} specified")
+    check_card(bc[0], "2", "Active Power (R30)",
+        ok=res['check2_power'],
+        actual=f"{res['p_poi']:.2f} MW @ POI",
+        required=f"{poi_mw:.1f} MW",
+        note=f"Loss chain: {res['p_loss_pct']:.1f}%")
+
+    check_card(bc[1], "1", "Energy / Overbuild (R29)",
+        ok=res['check1_energy'],
+        actual=f"{res['e_poi_bol']:.1f} MWh @ BOL",
+        required=f"{poi_mwh:.0f} MWh",
+        note=f"Overbuild: {res['overbuild_pct']:+.1f}%  |  Yrs above target: {res['overbuild_years']}")
+
+    check_card(bc[2], "3", "Reactive FERC 827 (R31)",
+        ok=res['check3_reactive'],
+        actual=f"{res['q_actual_mvbus']:.2f} MVAR @ MV bus",
+        required=f"{res['q_needed_mvbus']:.2f} MVAR @ MV bus",
+        note=f"POI target: {res['q_poi_target']:.2f} MVAR  |  PF {target_pf:.2f}")
+
+    mpt_ok = n_mpt*s_mpt >= res['min_mpt_mva']
+    check_card(bc[3], "—", "MPT Adequate",
+        ok=mpt_ok,
+        actual=f"{n_mpt*s_mpt:.0f} MVA specified",
+        required=f"{res['min_mpt_mva']:.1f} MVA min",
+        note=f"Margin: {n_mpt*s_mpt - res['min_mpt_mva']:+.1f} MVA")
 
     st.divider()
 
@@ -535,14 +563,12 @@ if run_btn:
 
     with t3:
         rows=[
-            {"Equipment":f"PCS Block ({pcs_model}) — Base","Qty":res['n_base'],
-             "Battery units/block":int(base_units),"Total batteries":res['n_base']*int(base_units)},
+            {"Equipment":f"PCS Block ({pcs_model})","Qty":res['n_base'],
+             "Battery units/block":int(base_units),"Total batteries":res['n_batt_bol']},
         ]
         if res['n_aug']>0:
-            rows.append({"Equipment":f"PCS Block ({pcs_model}) — Aug (BOL)","Qty":res['n_aug'],
-                "Battery units/block":int(aug_units_bol),"Total batteries":res['n_aug']*int(aug_units_bol)})
-            rows.append({"Equipment":f"Battery Units added at Year {aug_year}","Qty":res['n_batt_aug'],
-                "Battery units/block":"—","Total batteries":res['n_batt_aug']})
+            rows.append({"Equipment":f"PCS Block + Batteries added @ Year {int(aug_year)}","Qty":res['n_aug'],
+                "Battery units/block":int(base_units),"Total batteries":res['n_batt_aug']})
         rows += [
             {"Equipment":"MVT (Medium Voltage Transformer)","Qty":res['n_pcs'],
              "Battery units/block":"—","Total batteries":f"{res['n_pcs']*mvt_mva:.0f} MVA total"},
@@ -563,8 +589,8 @@ if run_btn:
 | Power | `ceil({res['p_inv_nd']:.1f} MW ÷ ({inv_mva}×{pcs_pf}))` | **{res['n_power']} blocks** |
 | Energy | `ceil({poi_mwh:.0f} ÷ ({res['blk_mwh_base']:.2f} × {soh_aug_disp}))` | **{res['n_energy']} blocks** |
 | **n_base** | `max({res['n_power']}, {res['n_energy']})` | **{res['n_base']} blocks** |
-| **n_aug** | from gap at year {aug_year} | **{res['n_aug']} blocks** |
-| **Total PCS** | n_base + n_aug | **{res['n_pcs']}** |
+| **n_aug** | `ceil(gap@yr{aug_year} / blk_mwh)` | **{res['n_aug']} blocks** |
+| **Total base PCS** | n_base | **{res['n_pcs']}** |
         """)
 
         loss_df=pd.DataFrame([
