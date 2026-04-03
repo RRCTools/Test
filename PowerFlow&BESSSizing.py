@@ -1,16 +1,15 @@
 """
-BESS Sizing Tool v2 — corrected engine matching Excel MAIN DC BESS
-Confirmed sizing logic:
-  n_power  = ceil(P_inv_needed / (inv_mva * pcs_pf))  [iterative for aux]
-  n_energy = ceil(poi_mwh / (units_per_blk * batt_mwh * ALL_eta))
-  n_final  = max(n_power, n_energy)
-  batteries = n_final * units_per_block
+BESS Sizing Tool v3 — correct augmentation logic
+Augmentation strategy:
+  - n_base = max(n_power, ceil(poi_mwh / (block_mwh * SOH[aug_year])))
+  - All n_base+n_aug PCS installed at BOL for power/reactive compliance
+  - Base blocks fully loaded; aug blocks partially loaded (aug_units_bol batteries)
+  - At aug_year: fill aug blocks to full battery complement
 """
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from math import ceil
 
 st.set_page_config(page_title="BESS Sizing Tool", layout="wide", page_icon="🔋")
@@ -18,53 +17,41 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap');
 html,body,[class*="css"]{font-family:'IBM Plex Sans',sans-serif;}
-.block-container{padding-top:.6rem;padding-bottom:1rem;}
+.block-container{padding-top:.5rem;}
 h1,h2,h3{font-family:'IBM Plex Mono',monospace;}
-div[data-testid="stSidebarContent"]{background:#0d1117;color:#e6edf3;}
+div[data-testid="stSidebarContent"]{background:#0d1117;}
 div[data-testid="stSidebarContent"] label,
 div[data-testid="stSidebarContent"] p,
 div[data-testid="stSidebarContent"] span{color:#c9d1d9 !important;}
-.sec{font-family:'IBM Plex Mono',monospace;font-size:.72rem;font-weight:600;
+.sec{font-family:'IBM Plex Mono',monospace;font-size:.70rem;font-weight:600;
      letter-spacing:.12em;text-transform:uppercase;color:#58a6ff;
-     border-bottom:1px solid #21262d;padding-bottom:3px;
-     margin-top:14px;margin-bottom:5px;}
-.badge-ok  {background:#0d3321;color:#3fb950;border:1px solid #238636;
-            padding:4px 10px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:.8rem;}
-.badge-fail{background:#3d1a1a;color:#f85149;border:1px solid #b62324;
-            padding:4px 10px;border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:.8rem;}
-.cascade-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;
-              padding:10px 14px;text-align:center;font-size:.82rem;}
-.cascade-label{color:#64748b;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;}
-.cascade-p{color:#1e40af;font-weight:700;font-size:1.05rem;}
-.cascade-q{color:#7c3aed;font-weight:600;}
-.cascade-s{color:#0f766e;font-weight:600;}
-.cascade-pf{color:#b45309;font-size:.78rem;}
-.arrow{color:#94a3b8;font-size:1.4rem;display:flex;align-items:center;justify-content:center;}
+     border-bottom:1px solid #21262d;padding-bottom:2px;
+     margin-top:12px;margin-bottom:4px;}
+.ok  {color:#3fb950;font-weight:700;}
+.fail{color:#f85149;font-weight:700;}
+.aug-box{background:#0f2c1a;border:1px solid #238636;border-radius:6px;
+         padding:10px 14px;margin:6px 0;font-size:.85rem;}
+.base-box{background:#0c1929;border:1px solid #1f6feb;border-radius:6px;
+          padding:10px 14px;margin:6px 0;font-size:.85rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  DEFAULT SOH CURVE  (from Excel MAIN DC Engine rows 111-131)
-# ══════════════════════════════════════════════════════════════════════════════
 DEFAULT_SOH = [1.0000,0.9342,0.9115,0.8933,0.8775,0.8633,0.8502,
                0.8381,0.8266,0.8158,0.8054,0.7955,0.7859,0.7767,
                0.7677,0.7590,0.7506,0.7424,0.7343,0.7265,0.7188]
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  3-BUS NR POWER FLOW  (same engine as test1final.py)
-# ══════════════════════════════════════════════════════════════════════════════
-def build_ybus(sbase, mpt_s, mpt_z, mpt_xr, mpt_i0, mpt_p0kw,
-               isu_s, isu_z, isu_xr, isu_i0, isu_p0kw, tap_c, q_cap=0.0):
-    rm = mpt_z*np.cos(np.arctan(mpt_xr)); xm = mpt_z*np.sin(np.arctan(mpt_xr))
-    Ys = (mpt_s/sbase)/complex(rm,xm)
-    gm = (mpt_p0kw/1e3)/mpt_s; bm = np.sqrt(max(mpt_i0**2-gm**2,0))
-    Ym = complex(gm,bm)*(mpt_s/sbase)
-    c  = 1.0-tap_c
-    if abs(c)<1e-9: c=1.0
+# ── 3-BUS NR POWER FLOW ──────────────────────────────────────────────────────
+def build_ybus(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,tap_c,q_cap=0.):
+    rm=mpt_z*np.cos(np.arctan(mpt_xr)); xm=mpt_z*np.sin(np.arctan(mpt_xr))
+    Ys=(mpt_s/sbase)/complex(rm,xm)
+    gm=(mpt_p0kw/1e3)/mpt_s; bm=np.sqrt(max(.001**2-gm**2,0))
+    Ym=complex(gm,bm)*(mpt_s/sbase)
+    c=1.-tap_c
+    if abs(c)<1e-9: c=1.
     Y10=(1-c)/c*Ys+Ym/c**2; Y12=c*Ys; Y20=(c-1)*Ys
     ri=isu_z*np.cos(np.arctan(isu_xr)); xi=isu_z*np.sin(np.arctan(isu_xr))
     Yi=(isu_s/sbase)/complex(ri,xi)
-    gi=(isu_p0kw/1e3)/isu_s; bi=np.sqrt(max(isu_i0**2-gi**2,0))
+    gi=(isu_p0kw/1e3)/isu_s; bi=np.sqrt(max(.005**2-gi**2,0))
     Ymi=complex(gi,-bi)*(isu_s/sbase)
     yc=complex(0,q_cap/sbase)
     Y=np.zeros((3,3),dtype=complex)
@@ -72,11 +59,11 @@ def build_ybus(sbase, mpt_s, mpt_z, mpt_xr, mpt_i0, mpt_p0kw,
     Y[1,1]=Y12+Y20+Yi+Ymi+yc; Y[1,2]=-Yi; Y[2,1]=-Yi; Y[2,2]=Yi
     return Y
 
-def nr_pf(Y,P3,Q3,V1=1.0,V2i=None,V3i=None,tol=1e-9,maxiter=100):
+def nr_pf(Y,P3,Q3,V1=1.,V2i=None,V3i=None,tol=1e-9,mi=100):
     if V2i is None: V2i=V1
     if V3i is None: V3i=V1
     V=np.array([V1,V2i,V3i]); th=np.zeros(3)
-    for _ in range(maxiter):
+    for _ in range(mi):
         Pc=np.zeros(3); Qc=np.zeros(3)
         for i in range(3):
             for j in range(3):
@@ -105,492 +92,507 @@ def nr_pf(Y,P3,Q3,V1=1.0,V2i=None,V3i=None,tol=1e-9,maxiter=100):
     return V,th,False
 
 @st.cache_data(show_spinner=False)
-def run_pf_sweep(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,
-                 isu_s,isu_z,isu_xr,isu_p0kw,
-                 P_max_pu,tap_c,q_cap,v_tgt):
-    Y=build_ybus(sbase,mpt_s,mpt_z,mpt_xr,0.001,mpt_p0kw,
-                 isu_s,isu_z,isu_xr,0.005,isu_p0kw,tap_c,q_cap)
-    S_isu=isu_s/sbase
-    rows=[]; V2p,V3p=v_tgt,v_tgt
-    for th in np.linspace(0,2*np.pi,121,endpoint=False):
-        P3=np.clip(S_isu*np.cos(th),-P_max_pu,P_max_pu)
-        Q3=S_isu*np.sin(th)
-        V,ang,conv=nr_pf(Y,P3,Q3,V1=v_tgt,V2i=V2p,V3i=V3p)
+def run_pf_sweep(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,P_max_pu,tap_c,q_cap,vt):
+    Y=build_ybus(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,tap_c,q_cap)
+    S=isu_s/sbase; rows=[]; V2p,V3p=vt,vt
+    for ang in np.linspace(0,2*np.pi,121,endpoint=False):
+        P3=np.clip(S*np.cos(ang),-P_max_pu,P_max_pu); Q3=S*np.sin(ang)
+        V,th,conv=nr_pf(Y,P3,Q3,V1=vt,V2i=V2p,V3i=V3p)
         if conv:
             V2p,V3p=V[1],V[2]
-            P1=sum(V[0]*V[j]*(Y[0,j].real*np.cos(ang[0]-ang[j])+Y[0,j].imag*np.sin(ang[0]-ang[j])) for j in range(3))
-            Q1=sum(V[0]*V[j]*(Y[0,j].real*np.sin(ang[0]-ang[j])-Y[0,j].imag*np.cos(ang[0]-ang[j])) for j in range(3))
-            rows.append({'P_inv_MW':P3*sbase,'Q_inv_MVAR':Q3*sbase,
-                         'V_POI':V[1],'V_ISU':V[2],
-                         'P_grid_MW':P1*sbase,'Q_grid_MVAR':Q1*sbase})
+            P1=sum(V[0]*V[j]*(Y[0,j].real*np.cos(th[0]-th[j])+Y[0,j].imag*np.sin(th[0]-th[j])) for j in range(3))
+            Q1=sum(V[0]*V[j]*(Y[0,j].real*np.sin(th[0]-th[j])-Y[0,j].imag*np.cos(th[0]-th[j])) for j in range(3))
+            rows.append({'P_inv_MW':P3*sbase,'Q_inv_MVAR':Q3*sbase,'V_POI':V[1],'V_ISU':V[2],'P_grid_MW':P1*sbase,'Q_grid_MVAR':Q1*sbase})
     return pd.DataFrame(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BESS SIZING ENGINE  (matches Excel MAIN DC Engine exactly)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── BESS SIZING ENGINE ────────────────────────────────────────────────────────
 def size_bess(poi_mw, poi_mwh, target_pf,
-              inv_mva, pcs_pf, units_per_blk, batt_mwh_dc, aux_kw_per_blk,
-              eta_pcs, eta_mvt, eta_mv_cable, eta_mpt, eta_transmission,
-              eta_dc_cable, eta_charge, eta_auxiliary,
-              project_years, aug_year, soh_curve, cap_bank_mvar=0.0):
+              inv_mva, pcs_pf, base_units, batt_mwh_dc, aux_kw_per_blk,
+              eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
+              eta_dc, eta_chg, eta_aux,
+              project_years, aug_year, aug_units_bol,
+              soh_curve, cap_mvar=0.):
 
-    # ── Loss chain (full, for energy) ──────────────────────────────────────
-    eta_all = eta_pcs*eta_mvt*eta_mv_cable*eta_mpt*eta_transmission*eta_dc_cable*eta_charge*eta_auxiliary
+    # Full loss chain
+    eta_all = eta_pcs*eta_mvt*eta_mv*eta_mpt*eta_tx*eta_dc*eta_chg*eta_aux
+    soh = soh_curve + [soh_curve[-1]]*(max(project_years+2-len(soh_curve),0))
 
-    # ── POWER constraint: iterative (aux depends on n) ──────────────────────
+    # Per-block energy at POI (base config, full load)
+    blk_mwh_base = base_units * batt_mwh_dc * eta_all
+
+    # ── POWER constraint (iterative for aux) ─────────────────────────────────
     n = 1
-    for _ in range(20):
-        aux_mw = n * aux_kw_per_blk / 1000.0
-        # Back-calculate required inverter power
-        p_mpt_lv    = poi_mw / (eta_mpt * eta_transmission)
-        p_mv_needed = p_mpt_lv + aux_mw
-        p_mvt_out   = p_mv_needed / eta_mv_cable
-        p_inv_needed= p_mvt_out  / eta_mvt
-        n_new = ceil(p_inv_needed / (inv_mva * pcs_pf))
+    for _ in range(25):
+        aux_mw   = n * aux_kw_per_blk / 1000.
+        p_mpt_lv = poi_mw / (eta_mpt * eta_tx)
+        p_mv     = p_mpt_lv + aux_mw
+        p_mvt    = p_mv  / eta_mv
+        p_inv_nd = p_mvt / eta_mvt
+        n_new    = ceil(p_inv_nd / (inv_mva * pcs_pf))
         if n_new == n: break
         n = n_new
     n_power = n
 
-    # ── ENERGY constraint: size for BOL nameplate target ───────────────────
-    block_mwh_poi = units_per_blk * batt_mwh_dc * eta_all
-    n_energy = ceil(poi_mwh / block_mwh_poi)
+    # ── ENERGY constraint for BASE blocks ────────────────────────────────────
+    if aug_year > 0:
+        soh_aug     = soh[min(aug_year, len(soh)-1)]
+        n_energy    = ceil(poi_mwh / (blk_mwh_base * soh_aug))
+    else:
+        n_energy    = ceil(poi_mwh / blk_mwh_base)
+        soh_aug     = 1.0
 
-    # ── Final count ──────────────────────────────────────────────────────────
-    n_blk = max(n_power, n_energy)
+    n_base = max(n_power, n_energy)
 
-    # ── Actuals (forward cascade) ────────────────────────────────────────────
-    aux_mw_act   = n_blk * aux_kw_per_blk / 1000.0
-    p_inv_act    = n_blk * inv_mva * pcs_pf
-    q_inv_act    = n_blk * inv_mva * np.sqrt(max(1-pcs_pf**2,0))
-    s_inv_act    = n_blk * inv_mva
-    p_mvt_out    = p_inv_act    * eta_mvt
-    q_mvt_out    = q_inv_act    * eta_mvt
-    p_mv_bus     = p_mvt_out   * eta_mv_cable
-    q_mv_bus     = q_mvt_out   * eta_mv_cable
-    p_mpt_in     = p_mv_bus    - aux_mw_act      # aux subtracted at MV bus
-    q_mpt_in     = q_mv_bus    + cap_bank_mvar    # cap bank helps reactive
-    p_poi_act    = p_mpt_in    * eta_mpt * eta_transmission
-    q_poi_act    = q_mpt_in    * eta_mpt * eta_transmission   # approx
-    s_poi_act    = np.sqrt(p_poi_act**2 + q_poi_act**2)
-    pf_poi_act   = p_poi_act / s_poi_act if s_poi_act > 0 else 1.0
+    # ── AUGMENTATION blocks ───────────────────────────────────────────────────
+    if aug_year > 0:
+        blk_mwh_aug_bol = aug_units_bol  * batt_mwh_dc * eta_all
+        blk_mwh_aug_full= base_units     * batt_mwh_dc * eta_all  # when fully loaded
+        e_base_at_aug   = n_base * blk_mwh_base * soh_aug
+        e_aug_partial   = 0.   # we place aug blocks at BOL with partial batteries
+        # How many aug blocks needed so that at aug_year, base+aug_partial >= target?
+        # (aug blocks also degrade from BOL to aug_year)
+        aug_needed_mwh  = poi_mwh - e_base_at_aug
+        if aug_needed_mwh > 0 and blk_mwh_aug_bol > 0:
+            # Each aug block contributes aug_bol energy degraded to aug_year
+            e_per_aug_block_at_aug = blk_mwh_aug_bol * soh_aug
+            n_aug = ceil(aug_needed_mwh / e_per_aug_block_at_aug)
+        else:
+            n_aug = 0
+        # Batteries added at augmentation: fill aug blocks from aug_units_bol → base_units
+        batt_added_per_aug_blk = base_units - aug_units_bol
+        n_batt_added_at_aug    = n_aug * batt_added_per_aug_blk
+    else:
+        n_aug = 0; aug_units_bol_eff = base_units
+        batt_added_per_aug_blk = 0; n_batt_added_at_aug = 0
 
-    # Reactive requirement
-    q_poi_needed = poi_mw * np.tan(np.arccos(target_pf))
-    s_poi_needed = poi_mw / target_pf
-    q_meets      = q_poi_act >= (q_poi_needed - 0.5)
+    # ALL PCS installed from day 1 (for power/reactive)
+    n_pcs_total = n_base + n_aug
 
-    # Energy
-    e_dc_act     = n_blk * units_per_blk * batt_mwh_dc
-    e_poi_bol    = e_dc_act * eta_all
+    # BOL batteries
+    n_batt_bol  = n_base * base_units + n_aug * aug_units_bol
+    # At aug year: add batteries to fill aug blocks
+    n_batt_aug  = n_batt_added_at_aug
 
-    # Min MPT MVA (from MV bus apparent power)
-    s_mvbus      = np.sqrt(p_mpt_in**2 + q_mpt_in**2)
-    min_mpt_mva  = s_mvbus
+    # ── Actual power cascade ──────────────────────────────────────────────────
+    aux_mw_act = n_pcs_total * aux_kw_per_blk / 1000.
+    p_inv_act  = n_pcs_total * inv_mva * pcs_pf
+    q_inv_act  = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0))
+    s_inv_act  = n_pcs_total * inv_mva
+    p_mvt_out  = p_inv_act * eta_mvt
+    q_mvt_out  = q_inv_act * eta_mvt
+    p_mv_bus   = p_mvt_out * eta_mv
+    q_mv_bus   = q_mvt_out * eta_mv
+    p_mpt_in   = p_mv_bus - aux_mw_act
+    q_mpt_in   = q_mv_bus + cap_mvar
+    p_poi      = p_mpt_in * eta_mpt * eta_tx
+    q_poi      = q_mpt_in * eta_mpt * eta_tx
+    s_poi      = np.sqrt(p_poi**2+q_poi**2)
+    pf_poi     = p_poi/s_poi if s_poi>0 else 1.
+    q_poi_need = poi_mw * np.tan(np.arccos(target_pf))
+    s_mv_bus   = np.sqrt(p_mpt_in**2+q_mpt_in**2)
+    min_mpt_mva= s_mv_bus
 
-    # ── Degradation schedule ─────────────────────────────────────────────────
-    soh = soh_curve + [soh_curve[-1]]*(max(project_years+1-len(soh_curve),0))
+    # ── Energy cascade @ BOL ─────────────────────────────────────────────────
+    e_dc_bol   = n_base*base_units*batt_mwh_dc + n_aug*aug_units_bol*batt_mwh_dc
+    e_poi_bol  = e_dc_bol * eta_all
+
+    # ── Degradation schedule ──────────────────────────────────────────────────
+    e_base_bol = n_base * blk_mwh_base
+    e_aug_partial_bol = n_aug * (aug_units_bol * batt_mwh_dc * eta_all)
+    # Aug block batteries added at aug_year = n_aug * (base_units-aug_units_bol) fresh
+    e_aug_new  = n_aug * (base_units-aug_units_bol) * batt_mwh_dc * eta_all if aug_year>0 else 0.
+
     deg = []
     for yr in range(project_years+1):
-        soh_yr = soh[min(yr, len(soh)-1)]
-        e_yr   = e_poi_bol * soh_yr
-        aug    = max(poi_mwh - e_yr, 0) if aug_year > 0 and yr == aug_year else 0.0
-        deg.append({'Year':yr,'SOH (%)':round(soh_yr*100,2),
-                    'Energy @ POI (MWh)':round(e_yr,1),
-                    'Augmentation (MWh)':round(aug,1)})
+        s_yr   = soh[min(yr,len(soh)-1)]
+        # Base energy degrades from yr 0
+        e_b    = e_base_bol * s_yr
+        # Aug partial (installed at BOL) also degrades from yr 0
+        e_ap   = e_aug_partial_bol * s_yr
+        # Aug new batteries added at aug_year, degrade from aug_year
+        if aug_year>0 and yr >= aug_year:
+            s_aug_rel = soh[min(yr-aug_year, len(soh)-1)]
+            e_an  = e_aug_new * s_aug_rel
+        else:
+            e_an  = 0.
+        e_tot  = e_b + e_ap + e_an
+
+        aug_ev = e_an if (aug_year>0 and yr==aug_year) else 0.
+        deg.append({'Year':yr, 'SOH (%)':round(s_yr*100,2),
+                    'Base E@POI (MWh)':round(e_b+e_ap,1),
+                    'Aug E added (MWh)':round(aug_ev,1),
+                    'Total E@POI (MWh)':round(e_tot,1)})
     deg_df = pd.DataFrame(deg)
 
-    # ── Power cascade table ──────────────────────────────────────────────────
-    def pf_(p,q): return p/np.sqrt(p**2+q**2) if np.sqrt(p**2+q**2)>0 else 1.0
-    def s_(p,q):  return np.sqrt(p**2+q**2)
-
+    # ── Cascade dict for SLD ──────────────────────────────────────────────────
+    def pf_(p,q): return p/np.sqrt(p**2+q**2) if np.sqrt(p**2+q**2)>0 else 1.
     cascade = {
-        'Inverter Output': {'P':p_inv_act,'Q':q_inv_act,'S':s_inv_act,'PF':pcs_pf},
-        'MVT Output':      {'P':p_mvt_out,'Q':q_mvt_out,'S':s_(p_mvt_out,q_mvt_out),'PF':pf_(p_mvt_out,q_mvt_out)},
-        'MV Bus\n(−Aux)':  {'P':p_mpt_in, 'Q':q_mpt_in, 'S':s_(p_mpt_in,q_mpt_in),'PF':pf_(p_mpt_in,q_mpt_in)},
-        'POI':             {'P':p_poi_act,'Q':q_poi_act,'S':s_poi_act,'PF':pf_poi_act},
+        'Inverter\nOutput': {'P':p_inv_act,'Q':q_inv_act,'S':s_inv_act,'PF':pcs_pf},
+        'MVT\nOutput':      {'P':p_mvt_out,'Q':q_mvt_out,'S':np.sqrt(p_mvt_out**2+q_mvt_out**2),'PF':pf_(p_mvt_out,q_mvt_out)},
+        'MV Bus\n(−Aux)':   {'P':p_mpt_in, 'Q':q_mpt_in, 'S':s_mv_bus,'PF':pf_(p_mpt_in,q_mpt_in)},
+        'POI':              {'P':p_poi,     'Q':q_poi,     'S':s_poi,   'PF':pf_poi},
     }
 
     return {
-        'n_blk': n_blk, 'n_batt': n_blk*units_per_blk,
-        'n_pcs': n_blk, 'n_mvt': n_blk,
-        'n_power': n_power, 'n_energy': n_energy,
-        'p_poi_act': p_poi_act, 'q_poi_act': q_poi_act,
-        's_inv_act': s_inv_act,
-        'e_poi_bol': e_poi_bol, 'e_dc_act': e_dc_act,
-        'q_poi_needed': q_poi_needed,
-        'q_meets': q_meets, 'p_meets': p_poi_act >= poi_mw*0.999,
-        'min_mpt_mva': min_mpt_mva,
-        'p_loss_pct': (1-eta_all)*100,
-        'eta_all': eta_all,
-        'block_mwh_poi': block_mwh_poi,
-        'cascade': cascade,
-        'deg_df': deg_df,
-        'p_inv_needed': p_inv_needed,
-        'aux_mw': aux_mw_act,
-        'p_mv_bus': p_mv_bus, 'q_mv_bus': q_mv_bus,
-        'p_mpt_in': p_mpt_in, 'q_mpt_in': q_mpt_in,
+        # Quantities
+        'n_base':n_base,'n_aug':n_aug,'n_pcs':n_pcs_total,
+        'n_batt_bol':n_batt_bol,'n_batt_aug':n_batt_aug,
+        'base_units':base_units,'aug_units_bol':aug_units_bol,
+        # Power
+        'p_poi':p_poi,'q_poi':q_poi,'s_inv':s_inv_act,
+        'min_mpt_mva':min_mpt_mva,'aux_mw':aux_mw_act,
+        'p_mv_bus':p_mv_bus,'q_mv_bus':q_mv_bus,
+        'p_mpt_in':p_mpt_in,'q_mpt_in':q_mpt_in,
+        'p_inv_nd':p_inv_nd,
+        # Energy
+        'e_poi_bol':e_poi_bol,'e_dc_bol':n_base*base_units*batt_mwh_dc+n_aug*aug_units_bol*batt_mwh_dc,
+        # Checks
+        'p_meets':p_poi>=poi_mw*.999,'e_meets':e_poi_bol>=poi_mwh*.999,
+        'q_meets':q_poi>=q_poi_need-.5,'q_poi_need':q_poi_need,
+        'overbuild_pct':(e_poi_bol-poi_mwh)/poi_mwh*100,
+        # Drivers
+        'n_power':n_power,'n_energy':n_energy,
+        'blk_mwh_base':blk_mwh_base,'eta_all':eta_all,
+        'soh_aug':soh_aug,
+        # Tables
+        'cascade':cascade,'deg_df':deg_df,
     }
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  SIDEBAR
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## 🔋 BESS Sizing")
 
     st.markdown('<div class="sec">Project</div>', unsafe_allow_html=True)
-    project_name = st.text_input("Project Name", value="Demo BESS", label_visibility="collapsed")
+    proj_name = st.text_input("", value="Demo BESS", label_visibility="collapsed")
     iso = st.selectbox("ISO", ["WECC","CAISO","ERCOT","PJM","MISO","NYISO","ISO-NE","Other"])
 
     st.markdown('<div class="sec">POI Requirements</div>', unsafe_allow_html=True)
-    poi_mw    = st.number_input("Nameplate Power @ POI (MW)",  value=200.0, min_value=1.0, step=10.0)
-    poi_mwh   = st.number_input("Nameplate Energy @ POI (MWh)", value=800.0, min_value=1.0, step=50.0)
-    poi_limit = st.number_input("POI Export Limit (MW)",         value=200.0, min_value=1.0, step=10.0)
-    proj_yrs  = st.number_input("Project Term (years)", value=20, min_value=1, max_value=40)
-    aug_year  = st.number_input("Augmentation Year (0=none)",   value=0,     min_value=0)
+    poi_mw   = st.number_input("Power @ POI (MW)",  value=200., min_value=1., step=10.)
+    poi_mwh  = st.number_input("Energy @ POI (MWh)", value=800., min_value=1., step=50.)
+    poi_lim  = st.number_input("Export Limit (MW)",  value=200., min_value=1., step=10.)
+    proj_yrs = st.number_input("Project Term (yr)",  value=20,  min_value=1, max_value=40)
+
+    st.markdown('<div class="sec">Augmentation</div>', unsafe_allow_html=True)
+    aug_year = st.number_input("Augmentation Year (0=none)", value=5, min_value=0, max_value=40,
+        help="Year when aug batteries are added. Base blocks sized to sustain until this year.")
+    if aug_year > 0:
+        aug_units_bol = st.number_input(
+            "Batteries pre-installed in aug blocks (at BOL)", value=2, min_value=0, max_value=20,
+            help="Aug PCS blocks are installed at BOL with this many batteries for partial energy. Rest added at aug_year.")
+    else:
+        aug_units_bol = 0
 
     st.markdown('<div class="sec">Reactive Power</div>', unsafe_allow_html=True)
-    pf_or_q = st.radio("", ["Target PF","Target MVAR"], horizontal=True, label_visibility="collapsed")
-    if pf_or_q == "Target PF":
-        target_pf   = st.number_input("Target PF @ POI", value=0.95, min_value=0.5, max_value=1.0, step=0.01)
+    pf_mode = st.radio("", ["Target PF","Target MVAR"], horizontal=True, label_visibility="collapsed")
+    if pf_mode=="Target PF":
+        target_pf = st.number_input("Target PF @ POI", value=0.95, min_value=0.5, max_value=1., step=.01)
         st.caption(f"Q = {poi_mw*np.tan(np.arccos(target_pf)):.1f} MVAR")
     else:
-        tmvar = st.number_input("Target MVAR @ POI", value=65.7, min_value=0.0, step=1.0)
-        target_pf = poi_mw/np.sqrt(poi_mw**2+tmvar**2) if tmvar else 1.0
+        tmvar = st.number_input("Target MVAR @ POI", value=65.7, min_value=0., step=1.)
+        target_pf = poi_mw/np.sqrt(poi_mw**2+tmvar**2) if tmvar else 1.
         st.caption(f"PF = {target_pf:.3f}")
-    cap_bank = st.number_input("Capacitor Bank (MVAR)", value=0.0, min_value=0.0, step=5.0)
+    cap_bank = st.number_input("Capacitor Bank (MVAR)", value=0., min_value=0., step=5.)
 
     st.markdown('<div class="sec">Grid / MPT</div>', unsafe_allow_html=True)
-    ca,cb = st.columns(2)
-    n_mpt = ca.number_input("#MPTs", value=1, min_value=1)
-    s_mpt = cb.number_input("MVA/MPT", value=240.0, min_value=10.0, step=10.0)
-    cc,cd = st.columns(2)
-    z_mpt  = cc.number_input("Z (pu)",  value=0.10, min_value=0.01, step=0.005, format="%.3f")
-    xr_mpt = cd.number_input("X/R MPT", value=40.0, min_value=1.0)
-    eta_mpt = st.number_input("MPT Efficiency", value=0.995, min_value=0.9, max_value=1.0, step=0.001, format="%.3f")
+    c1,c2 = st.columns(2)
+    n_mpt=c1.number_input("#MPTs",   value=1,     min_value=1)
+    s_mpt=c2.number_input("MVA/MPT", value=240.,  min_value=10., step=10.)
+    c3,c4 = st.columns(2)
+    z_mpt =c3.number_input("Z(pu)",  value=0.10, min_value=.01, step=.005, format="%.3f")
+    xr_mpt=c4.number_input("X/R",    value=40.,  min_value=1.)
+    eta_mpt=st.number_input("MPT η", value=0.995, min_value=.9, max_value=1., step=.001, format="%.3f")
 
-    has_oltc = st.checkbox("OLTC?", value=True)
+    has_oltc=st.checkbox("OLTC?", value=True)
     if has_oltc:
-        ce,cf = st.columns(2)
-        ntaps   = ce.number_input("#Taps", value=31, min_value=3, step=2)
-        tap_rng = cf.number_input("Range%", value=10.0, min_value=1.0)
-        tap_num = st.slider("Tap position", int(-(ntaps//2)), int(ntaps//2), 0)
-        tap_c   = tap_num * (tap_rng/100.0) / ((ntaps-1)/2.0)
+        c5,c6=st.columns(2)
+        ntaps  =c5.number_input("#Taps",  value=31, min_value=3, step=2)
+        tap_rng=c6.number_input("Range%", value=10., min_value=1.)
+        tap_num=st.slider("Tap", int(-(ntaps//2)), int(ntaps//2), 0)
+        tap_c  =tap_num*(tap_rng/100.)/((ntaps-1)/2.)
         st.caption(f"tap_c={tap_c:+.4f}  c={1-tap_c:.3f}")
-        fixed_tap = tap_c
     else:
-        fixed_tap = st.number_input("Fixed tap (pu)", value=0.0, step=0.005, format="%.3f")
-        tap_c = fixed_tap
+        tap_c=st.number_input("Fixed tap(pu)", value=0., step=.005, format="%.3f")
 
-    st.markdown('<div class="sec">PCS / Inverter Block</div>', unsafe_allow_html=True)
-    pcs_model = st.text_input("PCS Model", value="EPC POWER M10")
-    cg,ch = st.columns(2)
-    inv_mva = cg.number_input("Inv MVA", value=5.3, min_value=0.1, step=0.1)
-    mvt_mva = ch.number_input("MVT MVA", value=5.3, min_value=0.1, step=0.1)
-    pcs_pf  = st.number_input("PCS Operating PF", value=0.90, min_value=0.5, max_value=1.0, step=0.01,
-                               help="Operating PF of PCS. Determines P vs Q split per block.")
-    eta_pcs = st.number_input("PCS Efficiency", value=0.985, min_value=0.8, max_value=1.0, step=0.001, format="%.3f")
+    st.markdown('<div class="sec">PCS / Inverter</div>', unsafe_allow_html=True)
+    pcs_model=st.text_input("PCS Model", value="EPC POWER M10")
+    c7,c8=st.columns(2)
+    inv_mva=c7.number_input("Inv MVA",  value=5.3, min_value=.1, step=.1)
+    mvt_mva=c8.number_input("MVT MVA",  value=5.3, min_value=.1, step=.1)
+    pcs_pf =st.number_input("PCS Operating PF", value=0.90, min_value=.5, max_value=1., step=.01,
+        help="Sets the P/Q split per block. Drives the power constraint.")
+    eta_pcs=st.number_input("PCS η", value=0.985, min_value=.8, max_value=1., step=.001, format="%.3f")
 
     st.markdown('<div class="sec">Battery Unit</div>', unsafe_allow_html=True)
-    batt_model = st.text_input("Battery Model", value="BESS Unit")
-    ci,cj = st.columns(2)
-    batt_mwh    = ci.number_input("MWh/unit (DC)", value=6.138, min_value=0.1, step=0.1, format="%.3f")
-    units_per_blk = cj.number_input("Units/block", value=4, min_value=1)
-    aux_kw = st.number_input("Aux load/block (kW)", value=75.6, min_value=0.0, step=1.0)
+    batt_model=st.text_input("Battery Model", value="BESS Unit")
+    c9,c10=st.columns(2)
+    batt_mwh    =c9.number_input("MWh/unit(DC)", value=6.138, min_value=.1, step=.1, format="%.3f")
+    base_units  =c10.number_input("Units/block(base)", value=4, min_value=1,
+        help="Batteries per PCS in the base build")
+    aux_kw=st.number_input("Aux load/block(kW)", value=75.6, min_value=0., step=1.)
 
-    st.markdown('<div class="sec">MVT / ISU</div>', unsafe_allow_html=True)
-    ck,cl = st.columns(2)
-    z_isu  = ck.number_input("Z (pu)",  value=0.08, min_value=0.01, step=0.005, format="%.3f")
-    xr_isu = cl.number_input("X/R ISU", value=8.83, min_value=1.0)
-    eta_mvt = st.number_input("MVT Efficiency", value=0.990, min_value=0.8, max_value=1.0, step=0.001, format="%.3f")
+    st.markdown('<div class="sec">MVT/ISU</div>', unsafe_allow_html=True)
+    c11,c12=st.columns(2)
+    z_isu =c11.number_input("Z(pu)",  value=0.08, min_value=.01, step=.005, format="%.3f")
+    xr_isu=c12.number_input("X/R",    value=8.83, min_value=1.)
+    eta_mvt=st.number_input("MVT η",  value=0.990, min_value=.8, max_value=1., step=.001, format="%.3f")
 
     st.markdown('<div class="sec">Loss Factors</div>', unsafe_allow_html=True)
-    with st.expander("Edit AC losses"):
-        eta_mv_cable  = st.number_input("MV Cable",      value=0.995, min_value=0.9, max_value=1.0, step=0.001, format="%.3f")
-        eta_trans     = st.number_input("Transmission",  value=0.990, min_value=0.9, max_value=1.0, step=0.001, format="%.3f")
-        eta_auxiliary = st.number_input("Auxiliary",     value=0.998, min_value=0.9, max_value=1.0, step=0.001, format="%.3f")
-    with st.expander("Edit DC losses"):
-        eta_dc_cable  = st.number_input("DC Cable",        value=0.999, min_value=0.9, max_value=1.0, step=0.001, format="%.3f")
-        eta_charge    = st.number_input("Charge/Discharge",value=0.955, min_value=0.8, max_value=1.0, step=0.001, format="%.3f")
+    with st.expander("AC losses"):
+        eta_mv  =st.number_input("MV Cable",    value=.995, min_value=.9, max_value=1., step=.001, format="%.3f")
+        eta_tx  =st.number_input("Transmission",value=.990, min_value=.9, max_value=1., step=.001, format="%.3f")
+        eta_aux =st.number_input("Auxiliary",   value=.998, min_value=.9, max_value=1., step=.001, format="%.3f")
+    with st.expander("DC losses"):
+        eta_dc  =st.number_input("DC Cable",       value=.999, min_value=.9, max_value=1., step=.001, format="%.3f")
+        eta_chg =st.number_input("Charge/Disch",   value=.955, min_value=.8, max_value=1., step=.001, format="%.3f")
 
-    # ── SOH Degradation Curve (editable) ─────────────────────────────────────
-    st.markdown('<div class="sec">Battery Degradation Curve</div>', unsafe_allow_html=True)
-    with st.expander("Edit SOH curve (Year → SOH%)"):
-        st.caption("Default: Samsung SBB / standard Li-ion. Edit any year below.")
-        soh_rows = []
-        cols_header = st.columns([1,2])
-        cols_header[0].markdown("**Year**"); cols_header[1].markdown("**SOH %**")
-        for yr in range(min(int(proj_yrs)+1, 21)):
-            default_soh = DEFAULT_SOH[yr] if yr < len(DEFAULT_SOH) else DEFAULT_SOH[-1]
-            r1, r2 = st.columns([1,2])
-            r1.markdown(f"<div style='padding-top:8px'>{yr}</div>", unsafe_allow_html=True)
-            val = r2.number_input(f"soh_{yr}", value=float(round(default_soh*100,2)),
-                                  min_value=0.0, max_value=100.0, step=0.1,
-                                  label_visibility="collapsed", key=f"soh_yr_{yr}")
-            soh_rows.append(val/100.0)
-        soh_curve = soh_rows
+    st.markdown('<div class="sec">SOH Degradation Curve</div>', unsafe_allow_html=True)
+    with st.expander("Edit SOH by year"):
+        soh_vals=[]
+        for yr in range(min(int(proj_yrs)+1,21)):
+            dv=DEFAULT_SOH[yr] if yr<len(DEFAULT_SOH) else DEFAULT_SOH[-1]
+            r1,r2=st.columns([1,2])
+            r1.markdown(f"<div style='padding-top:8px;font-size:.82rem'>Yr {yr}</div>",unsafe_allow_html=True)
+            v=r2.number_input(f"s{yr}",value=float(round(dv*100,2)),min_value=0.,max_value=100.,
+                              step=.1,label_visibility="collapsed",key=f"soh{yr}")
+            soh_vals.append(v/100.)
+    soh_curve=soh_vals
 
     st.divider()
-    run_btn = st.button("▶  Run Sizing", type="primary", use_container_width=True)
-
+    run_btn=st.button("▶  Run Sizing", type="primary", use_container_width=True)
+    v_min_pf=st.number_input("V min (pu)",value=.95,min_value=.8,max_value=1.,step=.01)
+    v_max_pf=st.number_input("V max (pu)",value=1.05,min_value=1.,max_value=1.15,step=.01)
+    v_calc  =st.number_input("V calc(pu)",value=1.00,min_value=.8,max_value=1.15,step=.01)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HEADER
+# HEADER
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown(f"# 🔋 BESS Sizing Tool")
-st.caption(f"**{project_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ POI · {poi_limit:.0f} MW export limit")
+st.caption(f"**{proj_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ POI")
 st.divider()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  RUN
+# RUN
 # ══════════════════════════════════════════════════════════════════════════════
 if run_btn:
-    with st.spinner("Sizing BESS system…"):
+    with st.spinner("Sizing…"):
         res = size_bess(
-            poi_mw=poi_mw, poi_mwh=poi_mwh, target_pf=target_pf,
-            inv_mva=inv_mva, pcs_pf=pcs_pf,
-            units_per_blk=int(units_per_blk), batt_mwh_dc=batt_mwh,
-            aux_kw_per_blk=aux_kw,
-            eta_pcs=eta_pcs, eta_mvt=eta_mvt, eta_mv_cable=eta_mv_cable,
-            eta_mpt=eta_mpt, eta_transmission=eta_trans,
-            eta_dc_cable=eta_dc_cable, eta_charge=eta_charge,
-            eta_auxiliary=eta_auxiliary,
-            project_years=int(proj_yrs), aug_year=int(aug_year),
-            soh_curve=soh_curve, cap_bank_mvar=float(cap_bank)
+            poi_mw, poi_mwh, target_pf,
+            inv_mva, pcs_pf, int(base_units), batt_mwh, aux_kw,
+            eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
+            eta_dc, eta_chg, eta_aux,
+            int(proj_yrs), int(aug_year), int(aug_units_bol),
+            soh_curve, float(cap_bank)
         )
 
     # ── Equipment quantities ─────────────────────────────────────────────────
     st.subheader("📦 Equipment Quantities")
-    q1,q2,q3,q4,q5,q6 = st.columns(6)
-    q1.metric("Power Blocks (PCS)", str(res['n_blk']),
-              help=f"Power: {res['n_power']} blocks, Energy: {res['n_energy']} blocks → max")
-    q2.metric("Battery Units", str(res['n_batt']),
-              help=f"{res['n_blk']} blocks × {units_per_blk} units")
-    q3.metric("PCS Units", str(res['n_pcs']))
-    q4.metric("MVT Units", str(res['n_mvt']))
-    q5.metric("Min MPT MVA", f"{res['min_mpt_mva']:.1f} MVA",
-              delta=f"Specified {n_mpt*s_mpt:.0f} MVA {'✓' if n_mpt*s_mpt>=res['min_mpt_mva'] else '⚠'}")
-    q6.metric("Total DC Energy", f"{res['e_dc_act']:.0f} MWh")
+
+    # Base build
+    st.markdown(f"""
+    <div class="base-box">
+    <b>🏗 BASE BUILD (Day 1)</b><br>
+    <b>{res['n_base']}</b> PCS blocks × {base_units} batteries = <b>{res['n_base']*int(base_units)}</b> battery units<br>
+    {"&nbsp;&nbsp;+ <b>"+str(res['n_aug'])+"</b> AUG PCS blocks × "+str(aug_units_bol)+" batteries pre-installed = <b>"+str(res['n_aug']*int(aug_units_bol))+"</b> battery units" if res['n_aug']>0 else ""}
+    {"<br>Total PCS @ BOL: <b>"+str(res['n_pcs'])+"</b> &nbsp;|&nbsp; Total batteries @ BOL: <b>"+str(res['n_batt_bol'])+"</b>" if res['n_aug']>0 else ""}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if res['n_aug'] > 0:
+        st.markdown(f"""
+        <div class="aug-box">
+        <b>🔄 AUGMENTATION (Year {aug_year})</b><br>
+        Add <b>{int(base_units)-int(aug_units_bol)}</b> batteries to each of the {res['n_aug']} aug PCS blocks<br>
+        = <b>{res['n_batt_aug']}</b> batteries added at Year {aug_year}<br>
+        Total batteries after augmentation: <b>{res['n_batt_bol']+res['n_batt_aug']}</b>
+        </div>
+        """, unsafe_allow_html=True)
+
+    q1,q2,q3,q4,q5 = st.columns(5)
+    q1.metric("Total PCS (BOL)", str(res['n_pcs']),
+              help=f"n_base={res['n_base']} + n_aug={res['n_aug']}")
+    q2.metric("Batteries @ BOL", str(res['n_batt_bol']))
+    q3.metric("Batteries @ Aug", str(res['n_batt_aug']),
+              delta=f"Year {aug_year}" if aug_year>0 else "None")
+    q4.metric("Min MPT MVA", f"{res['min_mpt_mva']:.1f}",
+              delta=f"{'OK' if n_mpt*s_mpt>=res['min_mpt_mva'] else 'UNDERSIZE'}")
+    q5.metric("BOL overbuild", f"{res['overbuild_pct']:+.1f}%")
 
     st.divider()
 
-    # ── Sizing checks ────────────────────────────────────────────────────────
+    # ── Checks ──────────────────────────────────────────────────────────────
     st.subheader("✅ Sizing Checks")
     bc = st.columns(4)
-    def badge(col, ok, label, detail):
-        cls = "badge-ok" if ok else "badge-fail"
-        sym = "✓" if ok else "✗"
-        col.markdown(f'<div class="{cls}">{sym} {label}</div><div style="font-size:.78rem;color:#64748b;margin-top:3px">{detail}</div>', unsafe_allow_html=True)
-
-    badge(bc[0], res['p_meets'],  "Active Power",
-          f"{res['p_poi_act']:.1f} MW ≥ {poi_mw:.0f} MW")
-    badge(bc[1], res['e_poi_bol'] >= poi_mwh*0.999, "Energy @ BOL",
-          f"{res['e_poi_bol']:.1f} MWh ≥ {poi_mwh:.0f} MWh")
-    badge(bc[2], res['q_meets'],  "Reactive Power",
-          f"{res['q_poi_act']:.1f} MVAR avail, {res['q_poi_needed']:.1f} needed")
-    mpt_ok = (n_mpt*s_mpt) >= res['min_mpt_mva']
-    badge(bc[3], mpt_ok, "MPT Adequate",
-          f"Required {res['min_mpt_mva']:.1f} MVA, have {n_mpt*s_mpt:.0f} MVA")
+    def badge(col,ok,lbl,det):
+        cls="ok" if ok else "fail"; sym="✓" if ok else "✗"
+        col.markdown(f'<span class="{cls}">{sym} {lbl}</span><br><small style="color:#64748b">{det}</small>',unsafe_allow_html=True)
+    badge(bc[0],res['p_meets'],"Active Power",   f"{res['p_poi']:.1f} MW ≥ {poi_mw:.0f}")
+    badge(bc[1],res['e_meets'],"Energy @ BOL",   f"{res['e_poi_bol']:.1f} MWh ≥ {poi_mwh:.0f}")
+    badge(bc[2],res['q_meets'],"Reactive Power", f"{res['q_poi']:.1f} avail, {res['q_poi_need']:.1f} needed")
+    mpt_ok=n_mpt*s_mpt>=res['min_mpt_mva']
+    badge(bc[3],mpt_ok,"MPT Adequate",           f"{res['min_mpt_mva']:.1f} needed, {n_mpt*s_mpt:.0f} specified")
 
     st.divider()
 
-    # ── SINGLE LINE DIAGRAM ──────────────────────────────────────────────────
-    st.subheader("📐 Single Line Diagram — Power Flow Cascade")
+    # ── Single Line Diagram ──────────────────────────────────────────────────
+    st.subheader("📐 Power Flow Cascade")
 
     cas = res['cascade']
-    stages = list(cas.keys())
-
-    # Build SVG-style diagram using plotly
+    labels = [k.replace('\n',' ') for k in cas]
     fig_sld = go.Figure()
     fig_sld.update_layout(
-        plot_bgcolor='white', paper_bgcolor='white',
-        height=260, margin=dict(l=10,r=10,t=10,b=10),
-        xaxis=dict(visible=False, range=[-0.5,4.5]),
-        yaxis=dict(visible=False, range=[-0.3,1.5]),
-        showlegend=False
+        height=300, plot_bgcolor='white', paper_bgcolor='white',
+        margin=dict(l=5,r=5,t=30,b=5),
+        xaxis=dict(visible=False,range=[-0.6,4.6]),
+        yaxis=dict(visible=False,range=[-0.15,1.55]),
+        showlegend=False, title="Inverter → MVT → MV Bus → POI"
     )
+    for i,(stage,v) in enumerate(cas.items()):
+        x=i; pf_col='#16a34a' if v['PF']>=target_pf else '#dc2626'
+        fig_sld.add_shape(type='rect',x0=x-.38,x1=x+.38,y0=.52,y1=.62,
+                          fillcolor='#1e40af',line_color='#1e40af')
+        lbl=stage.replace('\n',' ')
+        fig_sld.add_annotation(x=x,y=1.48,text=f"<b>{lbl}</b>",showarrow=False,font=dict(size=11,color='#1e293b'))
+        fig_sld.add_annotation(x=x,y=1.28,text=f"P = {v['P']:.1f} MW",showarrow=False,font=dict(size=10,color='#1e40af'))
+        fig_sld.add_annotation(x=x,y=1.10,text=f"Q = {v['Q']:.1f} MVAR",showarrow=False,font=dict(size=10,color='#6d28d9'))
+        fig_sld.add_annotation(x=x,y=0.92,text=f"S = {v['S']:.1f} MVA",showarrow=False,font=dict(size=10,color='#0f766e'))
+        fig_sld.add_annotation(x=x,y=0.32,text=f"PF = {v['PF']:.3f}",showarrow=False,font=dict(size=10,color=pf_col))
+        if i<3:
+            fig_sld.add_annotation(x=x+.55,y=.57,text="→",showarrow=False,font=dict(size=20,color='#94a3b8'))
+    # Aux annotation
+    fig_sld.add_annotation(x=2,y=0.12,text=f"↑ Aux {res['aux_mw']:.2f} MW subtracted",
+                           showarrow=False,font=dict(size=9,color='#b45309'))
+    # POI target
+    fig_sld.add_annotation(x=3.5,y=0.12,
+        text=f"Target: {poi_mw:.0f} MW / {res['q_poi_need']:.1f} MVAR / PF {target_pf:.2f}",
+        showarrow=False,font=dict(size=9,color='#374151'))
+    st.plotly_chart(fig_sld,use_container_width=True)
 
-    # Bus bar line
-    for i, (stage, vals) in enumerate(cas.items()):
-        x = i
-        pf_val = vals['PF']
-        pf_color = '#16a34a' if pf_val >= target_pf else '#dc2626'
-        # Bus rectangle
-        fig_sld.add_shape(type='rect', x0=x-0.35, x1=x+0.35, y0=0.55, y1=0.65,
-                          fillcolor='#1e40af', line_color='#1e40af')
-        # Label above
-        label = stage.replace('\n',' ')
-        fig_sld.add_annotation(x=x, y=1.30, text=f"<b>{label}</b>",
-                               showarrow=False, font=dict(size=10, color='#1e40af'))
-        # P
-        fig_sld.add_annotation(x=x, y=1.10, text=f"P = {vals['P']:.1f} MW",
-                               showarrow=False, font=dict(size=10, color='#1e40af'))
-        # Q
-        fig_sld.add_annotation(x=x, y=0.90, text=f"Q = {vals['Q']:.1f} MVAR",
-                               showarrow=False, font=dict(size=10, color='#7c3aed'))
-        # S
-        fig_sld.add_annotation(x=x, y=0.72, text=f"S = {vals['S']:.1f} MVA",
-                               showarrow=False, font=dict(size=10, color='#0f766e'))
-        # PF
-        fig_sld.add_annotation(x=x, y=0.30, text=f"PF = {pf_val:.3f}",
-                               showarrow=False, font=dict(size=10, color=pf_color))
-        # Arrow between stages
-        if i < len(stages)-1:
-            fig_sld.add_annotation(x=x+0.55, y=0.60, text="→",
-                                   showarrow=False, font=dict(size=18, color='#94a3b8'))
-
-    # Add aux label at MV bus
-    fig_sld.add_annotation(x=2, y=0.10,
-        text=f"⬆ Aux = {res['aux_mw']:.2f} MW",
-        showarrow=False, font=dict(size=9, color='#b45309'))
-
-    # Add POI target
-    poi_P = cas['POI']['P']; poi_Q = cas['POI']['Q']; poi_S = cas['POI']['S']
-    poi_pf_col = '#16a34a' if cas['POI']['PF'] >= target_pf else '#dc2626'
-
-    st.plotly_chart(fig_sld, use_container_width=True)
-
-    # Numeric cascade table below diagram
-    cascade_data = []
-    for stage, vals in cas.items():
-        cascade_data.append({
-            'Stage': stage.replace('\n',' '),
-            'P (MW)': round(vals['P'],2),
-            'Q (MVAR)': round(vals['Q'],2),
-            'S (MVA)': round(vals['S'],2),
-            'PF': round(vals['PF'],4),
-        })
-    # Add POI target row
-    q_need = res['q_poi_needed']
-    cascade_data.append({
-        'Stage': '▶ POI Target',
-        'P (MW)': poi_mw,
-        'Q (MVAR)': round(q_need,2),
-        'S (MVA)': round(poi_mw/target_pf,2),
-        'PF': target_pf,
-    })
-    st.dataframe(pd.DataFrame(cascade_data).set_index('Stage'), use_container_width=True)
+    # Cascade table
+    cdf = pd.DataFrame([
+        {'Stage':k.replace('\n',' '),'P (MW)':round(v['P'],2),
+         'Q (MVAR)':round(v['Q'],2),'S (MVA)':round(v['S'],2),'PF':round(v['PF'],4)}
+        for k,v in cas.items()
+    ])
+    cdf.loc[len(cdf)] = {'Stage':'▶ POI Target','P (MW)':poi_mw,
+        'Q (MVAR)':round(res['q_poi_need'],2),'S (MVA)':round(poi_mw/target_pf,2),'PF':target_pf}
+    st.dataframe(cdf.set_index('Stage'),use_container_width=True)
 
     st.divider()
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    t1, t2, t3, t4 = st.tabs(["📈 PV Curve","📉 Degradation","📋 Equipment List","🔢 Loss Chain"])
+    t1,t2,t3,t4 = st.tabs(["📈 PV Curve","📉 Degradation","📋 Equipment","🔢 Sizing Logic"])
 
     with t1:
-        with st.spinner("Running power flow…"):
-            isu_s_total = res['n_mvt'] * mvt_mva
-            isu_p0kw    = 8.0 * res['n_mvt']
-            P_max_pu    = res['n_blk'] * inv_mva * pcs_pf / poi_limit
+        with st.spinner("Running power flow sweep…"):
+            isu_s = res['n_pcs'] * mvt_mva
             df_pf = run_pf_sweep(
-                poi_limit, float(n_mpt*s_mpt), z_mpt, xr_mpt, 10.0*n_mpt,
-                isu_s_total, z_isu, xr_isu, isu_p0kw,
-                P_max_pu, tap_c, float(cap_bank), float(
-                    st.session_state.get('v_calc', 1.0))
+                float(poi_lim), float(n_mpt*s_mpt), z_mpt, xr_mpt, 10.*n_mpt,
+                isu_s, z_isu, xr_isu, 8.*res['n_pcs'],
+                res['n_pcs']*inv_mva*pcs_pf/poi_lim,
+                tap_c, float(cap_bank), float(v_calc)
             )
-
-        v_calc_pf = 1.0
-        v_min_pf = 0.95; v_max_pf = 1.05
-
-        if len(df_pf) > 0:
-            df_lead = df_pf[df_pf['Q_inv_MVAR']>=0].sort_values('P_inv_MW')
-            df_lag  = df_pf[df_pf['Q_inv_MVAR']< 0].sort_values('P_inv_MW')
-            fig_pv = go.Figure()
-            fig_pv.add_hrect(y0=v_min_pf, y1=v_max_pf, fillcolor='lightgreen', opacity=0.10, line_width=0)
-            fig_pv.add_hline(y=v_min_pf, line_dash='dash', line_color='red', line_width=1.5)
-            fig_pv.add_hline(y=v_max_pf, line_dash='dash', line_color='red', line_width=1.5)
-            fig_pv.add_vline(x=poi_mw, line_dash='dot', line_color='gray',
-                             annotation_text=f"{poi_mw:.0f} MW")
-            if len(df_lead): fig_pv.add_trace(go.Scatter(x=df_lead['P_inv_MW'],y=df_lead['V_POI'],
-                mode='lines',name='Leading Q',line=dict(color='royalblue',width=2.5)))
-            if len(df_lag):  fig_pv.add_trace(go.Scatter(x=df_lag['P_inv_MW'], y=df_lag['V_POI'],
-                mode='lines',name='Lagging Q',line=dict(color='darkorange',width=2.5)))
-            y_lo = max(0.80, df_pf['V_POI'].min()-0.03)
-            y_hi = min(1.25, df_pf['V_POI'].max()+0.03)
-            fig_pv.update_layout(title="PV Curve — POI Voltage vs Active Power",
+        if len(df_pf):
+            dl=df_pf[df_pf['Q_inv_MVAR']>=0].sort_values('P_inv_MW')
+            dg=df_pf[df_pf['Q_inv_MVAR']< 0].sort_values('P_inv_MW')
+            fig=go.Figure()
+            fig.add_hrect(y0=v_min_pf,y1=v_max_pf,fillcolor='lightgreen',opacity=.10,line_width=0)
+            fig.add_hline(y=v_min_pf,line_dash='dash',line_color='red',line_width=1.5)
+            fig.add_hline(y=v_max_pf,line_dash='dash',line_color='red',line_width=1.5)
+            fig.add_vline(x=poi_mw,line_dash='dot',line_color='gray',annotation_text=f"{poi_mw:.0f} MW")
+            if len(dl): fig.add_trace(go.Scatter(x=dl['P_inv_MW'],y=dl['V_POI'],mode='lines',name='Leading Q',line=dict(color='royalblue',width=2.5)))
+            if len(dg): fig.add_trace(go.Scatter(x=dg['P_inv_MW'],y=dg['V_POI'],mode='lines',name='Lagging Q', line=dict(color='darkorange',width=2.5)))
+            y_lo=max(.80,df_pf['V_POI'].min()-.03); y_hi=min(1.25,df_pf['V_POI'].max()+.03)
+            fig.update_layout(title="PV Curve — POI Voltage vs Active Power",
                 xaxis_title="P_inv (MW)",yaxis_title="V_POI (pu)",
-                yaxis=dict(range=[y_lo,y_hi]),height=420,legend=dict(x=0.01,y=0.99))
-            st.plotly_chart(fig_pv, use_container_width=True)
-            v_nom = df_pf.loc[(df_pf['P_inv_MW']-poi_mw).abs().idxmin(),'V_POI']
-            c1,c2,c3 = st.columns(3)
-            c1.metric("V_POI @ rated P", f"{v_nom:.4f} pu")
-            c2.metric("% pts in band", f"{((df_pf['V_POI']>=v_min_pf)&(df_pf['V_POI']<=v_max_pf)).mean()*100:.1f}%")
-            c3.metric("Converged pts", f"{len(df_pf)}/121")
+                yaxis=dict(range=[y_lo,y_hi]),height=420,legend=dict(x=.01,y=.99))
+            st.plotly_chart(fig,use_container_width=True)
+            v_nom=df_pf.loc[(df_pf['P_inv_MW']-poi_mw).abs().idxmin(),'V_POI']
+            p1,p2,p3=st.columns(3)
+            p1.metric("V@rated P",f"{v_nom:.4f} pu")
+            p2.metric("% in V-band",f"{((df_pf['V_POI']>=v_min_pf)&(df_pf['V_POI']<=v_max_pf)).mean()*100:.1f}%")
+            p3.metric("Converged",f"{len(df_pf)}/121")
         else:
-            st.warning("Power flow did not converge. Check tap position and MPT size.")
+            st.warning("Power flow did not converge. Check tap position.")
 
     with t2:
-        fig_deg = go.Figure()
-        fig_deg.add_hline(y=poi_mwh, line_dash='dash', line_color='red',
-                          annotation_text=f"Target {poi_mwh:.0f} MWh")
-        fig_deg.add_trace(go.Scatter(x=res['deg_df']['Year'],
-            y=res['deg_df']['Energy @ POI (MWh)'],
-            mode='lines+markers', name='Energy @ POI',
-            line=dict(color='royalblue',width=2.5), marker=dict(size=6)))
-        aug_rows = res['deg_df'][res['deg_df']['Augmentation (MWh)']>0]
+        fig2=go.Figure()
+        fig2.add_hline(y=poi_mwh,line_dash='dash',line_color='red',annotation_text=f"Target {poi_mwh:.0f} MWh")
+        fig2.add_trace(go.Scatter(x=res['deg_df']['Year'],y=res['deg_df']['Total E@POI (MWh)'],
+            mode='lines+markers',name='Total E@POI',line=dict(color='royalblue',width=2.5),marker=dict(size=6)))
+        fig2.add_trace(go.Scatter(x=res['deg_df']['Year'],y=res['deg_df']['Base E@POI (MWh)'],
+            mode='lines',name='Base only',line=dict(color='lightblue',width=1.5,dash='dot')))
+        aug_rows=res['deg_df'][res['deg_df']['Aug E added (MWh)']>0]
         if len(aug_rows):
-            fig_deg.add_trace(go.Bar(x=aug_rows['Year'],y=aug_rows['Augmentation (MWh)'],
-                name='Augmentation',marker_color='green',opacity=0.6))
-        fig_deg.update_layout(title="Energy @ POI over Project Life",
+            fig2.add_trace(go.Bar(x=aug_rows['Year'],y=aug_rows['Aug E added (MWh)'],
+                name='Augmentation added',marker_color='#16a34a',opacity=.7))
+        fig2.update_layout(title="Energy @ POI over Project Life",
             xaxis_title="Year",yaxis_title="MWh",height=380)
-        st.plotly_chart(fig_deg, use_container_width=True)
-        st.dataframe(res['deg_df'].set_index('Year'), use_container_width=True)
-        st.download_button("⬇ Download Degradation Table",
-            res['deg_df'].to_csv(index=False),"degradation.csv","text/csv")
+        st.plotly_chart(fig2,use_container_width=True)
+        st.dataframe(res['deg_df'].set_index('Year'),use_container_width=True)
+        st.download_button("⬇ Degradation CSV",res['deg_df'].to_csv(index=False),"degradation.csv","text/csv")
 
     with t3:
-        equip = pd.DataFrame([
-            {"Equipment": f"PCS Block ({pcs_model})","Qty": res['n_pcs'],
-             "Unit Size": f"{inv_mva} MVA","Total":f"{res['s_inv_act']:.1f} MVA"},
-            {"Equipment": f"Battery Unit ({batt_model})","Qty": res['n_batt'],
-             "Unit Size": f"{batt_mwh} MWh DC","Total":f"{res['e_dc_act']:.1f} MWh DC"},
-            {"Equipment": "MVT (Medium Voltage Transformer)","Qty": res['n_mvt'],
-             "Unit Size": f"{mvt_mva} MVA","Total":f"{res['n_mvt']*mvt_mva:.1f} MVA"},
-            {"Equipment": "MPT (Main Power Transformer)","Qty": n_mpt,
-             "Unit Size": f"{s_mpt:.0f} MVA","Total":f"{n_mpt*s_mpt:.0f} MVA"},
-        ])
-        st.dataframe(equip.set_index("Equipment"), use_container_width=True)
-        st.download_button("⬇ Download Equipment List",
-            equip.to_csv(index=False),"equipment.csv","text/csv")
-
-        st.markdown("**Sizing Drivers**")
-        driver = "POWER" if res['n_power'] >= res['n_energy'] else "ENERGY"
-        st.info(f"Sizing driven by **{driver}** constraint\n"
-                f"- Power blocks needed: **{res['n_power']}** "
-                f"(p_inv={res['p_inv_needed']:.1f} MW ÷ {inv_mva*pcs_pf:.2f} MW/block)\n"
-                f"- Energy blocks needed: **{res['n_energy']}** "
-                f"({poi_mwh:.0f} MWh ÷ {res['block_mwh_poi']:.2f} MWh/block @ POI)")
+        rows=[
+            {"Equipment":f"PCS Block ({pcs_model}) — Base","Qty":res['n_base'],
+             "Battery units/block":int(base_units),"Total batteries":res['n_base']*int(base_units)},
+        ]
+        if res['n_aug']>0:
+            rows.append({"Equipment":f"PCS Block ({pcs_model}) — Aug (BOL)","Qty":res['n_aug'],
+                "Battery units/block":int(aug_units_bol),"Total batteries":res['n_aug']*int(aug_units_bol)})
+            rows.append({"Equipment":f"Battery Units added at Year {aug_year}","Qty":res['n_batt_aug'],
+                "Battery units/block":"—","Total batteries":res['n_batt_aug']})
+        rows += [
+            {"Equipment":"MVT (Medium Voltage Transformer)","Qty":res['n_pcs'],
+             "Battery units/block":"—","Total batteries":f"{res['n_pcs']*mvt_mva:.0f} MVA total"},
+            {"Equipment":"MPT (Main Power Transformer)","Qty":n_mpt,
+             "Battery units/block":"—","Total batteries":f"{n_mpt*s_mpt:.0f} MVA (min {res['min_mpt_mva']:.1f})"},
+        ]
+        st.dataframe(pd.DataFrame(rows).set_index("Equipment"),use_container_width=True)
+        st.download_button("⬇ Equipment CSV",pd.DataFrame(rows).to_csv(index=False),"equipment.csv","text/csv")
 
     with t4:
-        loss_df = pd.DataFrame([
-            {"Stage":"Transmission", "η":eta_trans,  "Loss %":f"{(1-eta_trans)*100:.1f}%"},
-            {"Stage":"MPT",          "η":eta_mpt,    "Loss %":f"{(1-eta_mpt)*100:.1f}%"},
-            {"Stage":"MV Cable",     "η":eta_mv_cable,"Loss %":f"{(1-eta_mv_cable)*100:.1f}%"},
-            {"Stage":"MVT",          "η":eta_mvt,    "Loss %":f"{(1-eta_mvt)*100:.1f}%"},
-            {"Stage":"PCS",          "η":eta_pcs,    "Loss %":f"{(1-eta_pcs)*100:.1f}%"},
-            {"Stage":"DC Cable",     "η":eta_dc_cable,"Loss %":f"{(1-eta_dc_cable)*100:.1f}%"},
-            {"Stage":"Charge/Disch", "η":eta_charge, "Loss %":f"{(1-eta_charge)*100:.1f}%"},
-            {"Stage":"Auxiliary",    "η":eta_auxiliary,"Loss %":f"{(1-eta_auxiliary)*100:.1f}%"},
-            {"Stage":"→ TOTAL",      "η":round(res['eta_all'],5),"Loss %":f"{res['p_loss_pct']:.2f}%"},
+        driver="POWER" if res['n_power']>=res['n_energy'] else "ENERGY"
+        soh_aug_disp=f"SOH[{aug_year}]={res['soh_aug']:.4f}" if aug_year>0 else "no augmentation"
+        st.info(f"""
+**Sizing driver: {driver}**
+
+| Constraint | Formula | Result |
+|-----------|---------|--------|
+| Power | `ceil({res['p_inv_nd']:.1f} MW ÷ ({inv_mva}×{pcs_pf}))` | **{res['n_power']} blocks** |
+| Energy | `ceil({poi_mwh:.0f} ÷ ({res['blk_mwh_base']:.2f} × {soh_aug_disp}))` | **{res['n_energy']} blocks** |
+| **n_base** | `max({res['n_power']}, {res['n_energy']})` | **{res['n_base']} blocks** |
+| **n_aug** | from gap at year {aug_year} | **{res['n_aug']} blocks** |
+| **Total PCS** | n_base + n_aug | **{res['n_pcs']}** |
+        """)
+
+        loss_df=pd.DataFrame([
+            {"Stage":"Transmission","η":eta_tx},{"Stage":"MPT","η":eta_mpt},
+            {"Stage":"MV Cable","η":eta_mv},{"Stage":"MVT","η":eta_mvt},
+            {"Stage":"PCS","η":eta_pcs},{"Stage":"DC Cable","η":eta_dc},
+            {"Stage":"Charge/Disch","η":eta_chg},{"Stage":"Auxiliary","η":eta_aux},
+            {"Stage":"→ TOTAL","η":round(res['eta_all'],5)},
         ])
-        st.dataframe(loss_df.set_index("Stage"), use_container_width=True)
+        st.dataframe(loss_df.set_index("Stage"),use_container_width=True)
 
 else:
-    st.info("👈 Fill project parameters, then press **▶ Run Sizing**")
-    with st.expander("ℹ️ Sizing methodology"):
+    st.info("👈 Set parameters in the sidebar and press **▶ Run Sizing**")
+    with st.expander("ℹ️ Augmentation logic"):
         st.markdown("""
-**Two constraints, max wins:**
+**With augmentation (aug_year > 0):**
 
-| Constraint | Formula |
-|-----------|---------|
-| Power | `ceil(P_inv_needed / (inv_MVA × PCS_PF))`  |
-| Energy | `ceil(POI_MWh / (units × batt_MWh × η_total))` |
-| **Final** | **`max(power_blocks, energy_blocks)`** |
+1. **n_power** = ceil(P_inv_needed / (inv_MVA × PCS_PF))  — from power delivery requirement
+2. **n_energy** = ceil(POI_MWh / (block_MWh × SOH[aug_year]))  — base must last *until* aug_year
+3. **n_base** = max(n_power, n_energy)
+4. **n_aug** = ceil(gap_at_aug_year / (aug_units × batt_MWh × η))
+5. All n_base+n_aug **PCS installed at BOL** (for power/reactive compliance)
+6. Aug blocks carry `aug_units_bol` batteries at BOL, filled to full at aug_year
 
-**Loss chain (POI ← losses ← DC battery):**
-```
-DC battery → η_charge → η_dc_cable → η_pcs → η_mvt
-          → η_mv_cable → −Aux → η_mpt → η_transmission → POI
-```
-**Power flow:** 3-bus NR (Bus1=Grid swing, Bus2=POI, Bus3=PCS bus).
-Sweep traces ISU/MVT S-circle to generate PV curve.
+**Example: 200MW / 800MWh, aug_year=5, PCS_PF=0.90, 5.3 MVA, 6.138 MWh/unit, 4 units/block:**
+- n_power = 44, n_energy = ceil(800/22.34/0.8633) = 42 → n_base = 44
+- E@aug_yr5 = 44×22.34×0.8633 = 849 MWh > 800 → n_aug = 0
+- Result: 44 PCS × 4 batteries = 176 units
+
+**For 39+5 split:** use aug_year=5 with 2 batteries in aug blocks, fewer base blocks
         """)
