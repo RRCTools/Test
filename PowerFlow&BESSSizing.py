@@ -130,6 +130,13 @@ def size_config(poi_mw, poi_mwh, target_pf,
     eta_all = compute_eta(eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux)
     soh = soh_curve + [soh_curve[-1]]*(max(project_years+2-len(soh_curve),0))
 
+    # ── Derive overbuild % from SOH at aug_year (or project_years if no aug) ─
+    # overbuild_pct is IGNORED if passed — always derived from SOH curve
+    # E_BOL × SOH[ref] ≥ poi_mwh  →  overbuild = (1/SOH[ref] - 1) × 100
+    _soh_ref_idx = min(aug_year, len(soh)-1) if aug_year > 0 else min(project_years, len(soh)-1)
+    _soh_ref     = soh[_soh_ref_idx]
+    overbuild_pct = (1.0 / _soh_ref - 1.0) * 100.0   # derived, not user input
+
     # ── Q requirement at POI ──────────────────────────────────────────────────
     q_poi_target = poi_mw * np.tan(np.arccos(target_pf))
 
@@ -300,14 +307,28 @@ with st.sidebar:
     cap_bank = st.number_input("Capacitor Bank (MVAR)", value=0., min_value=0., step=5.)
 
     st.markdown('<div class="sec">Energy Strategy</div>', unsafe_allow_html=True)
-    overbuild_pct = st.number_input(
-        "Overbuild % at BOL", value=15.0, min_value=0., max_value=100., step=1.,
-        help="Extra energy installed above nameplate so degradation reaches target at aug_year. "
-             "E_installed = poi_mwh × (1 + overbuild%/100)")
-    aug_year = st.number_input("Augmentation Year (0=none)", value=10, min_value=0, max_value=40,
-        help="Year when aug PCS+batteries are added. Sized to restore to poi_mwh target.")
-    st.caption(f"E_BOL target = {poi_mwh*(1+overbuild_pct/100):.0f} MWh  "
-               f"({'reaches target at aug yr' if aug_year>0 else 'must survive full term'})")
+    aug_year = st.number_input("Augmentation Year (0 = none)", value=5, min_value=0, max_value=40,
+        help="Year when augmentation batteries are added.\n"
+             "0 = no augmentation — system must survive full project term.\n"
+             "Overbuild % is automatically derived from the SOH at this year.")
+    # Overbuild is derived — not a user input
+    # E_BOL must satisfy: E_BOL × SOH[aug_year] ≥ poi_mwh
+    # ↔ E_BOL ≥ poi_mwh / SOH[aug_year]
+    # ↔ overbuild% = (1/SOH[aug_year] - 1) × 100
+    _soh_ref_idx = min(int(aug_year), len(DEFAULT_SOH)-1) if aug_year > 0 else min(int(proj_yrs), len(DEFAULT_SOH)-1)
+    # Use user-edited SOH if available (approximation from DEFAULT for sidebar display)
+    _soh_at_ref  = DEFAULT_SOH[_soh_ref_idx]
+    overbuild_pct = (1.0 / _soh_at_ref - 1.0) * 100.0
+    if aug_year > 0:
+        st.caption(
+            f"SOH at yr {int(aug_year)} = **{_soh_at_ref*100:.2f}%** → "
+            f"Overbuild = **{overbuild_pct:.1f}%** → "
+            f"E_BOL target = **{poi_mwh*(1+overbuild_pct/100):.0f} MWh** (reaches target at aug yr)")
+    else:
+        st.caption(
+            f"SOH at yr {int(proj_yrs)} = **{_soh_at_ref*100:.2f}%** → "
+            f"Overbuild = **{overbuild_pct:.1f}%** → "
+            f"E_BOL target = **{poi_mwh*(1+overbuild_pct/100):.0f} MWh** (must survive full {int(proj_yrs)} yr)")
 
     st.markdown('<div class="sec">Grid / MPT</div>', unsafe_allow_html=True)
     c1,c2=st.columns(2)
@@ -387,7 +408,7 @@ with st.sidebar:
 # ── HEADER ────────────────────────────────────────────────────────────────────
 st.markdown("# 🔋 BESS Sizing Tool")
 st.caption(f"**{proj_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ POI · "
-           f"PF {target_pf:.2f} · {overbuild_pct:.0f}% overbuild · aug yr {int(aug_year)}")
+           f"PF {target_pf:.2f} · aug yr {int(aug_year)}")
 st.divider()
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
@@ -405,7 +426,7 @@ if run_btn:
     st.session_state['bess_ratios']    = bess_ratios
     st.session_state['bess_params']    = dict(
         poi_mw=poi_mw, poi_mwh=poi_mwh, target_pf=target_pf,
-        aug_year=aug_year, overbuild_pct=overbuild_pct, proj_yrs=proj_yrs,
+        aug_year=aug_year, proj_yrs=proj_yrs,
         n_mpt=n_mpt, s_mpt=s_mpt, inv_mva=inv_mva, mvt_mva=mvt_mva,
         batt_mwh=batt_mwh, aux_kw=aux_kw, eta_mvt=eta_mvt, eta_mv=eta_mv,
         eta_mpt=eta_mpt, eta_tx=eta_tx, eta_pcs=eta_pcs, cap_bank=cap_bank,
@@ -419,7 +440,7 @@ if 'bess_results' in st.session_state:
     p           = st.session_state['bess_params']
     # Use the params from when Run was pressed (not current sidebar state)
     poi_mw=p['poi_mw']; poi_mwh=p['poi_mwh']; target_pf=p['target_pf']
-    aug_year=p['aug_year']; overbuild_pct=p['overbuild_pct']; proj_yrs=p['proj_yrs']
+    aug_year=p['aug_year']; proj_yrs=p['proj_yrs']
     n_mpt=p['n_mpt']; s_mpt=p['s_mpt']; inv_mva=p['inv_mva']; mvt_mva=p['mvt_mva']
     batt_mwh=p['batt_mwh']; aux_kw=p['aux_kw']; eta_mvt=p['eta_mvt']; eta_mv=p['eta_mv']
     eta_mpt=p['eta_mpt']; eta_tx=p['eta_tx']; eta_pcs=p['eta_pcs']; cap_bank=p['cap_bank']
