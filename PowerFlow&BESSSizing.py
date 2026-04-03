@@ -198,13 +198,13 @@ def size_bess(poi_mw, poi_mwh, target_pf,
                     e_tot += eg * s_rel
                     if yr == aug_year:
                         aug_event += eg
-        deg.append({'Year':yr, 'SOH (%)':round(s_yr*100,2),
-                    'G1 E@POI (MWh)':round(e_group_bol[0]*s_yr,1),
-                    'Aug E added (MWh)':round(aug_event,1),
-                    'Total E@POI (MWh)':round(e_tot,1)})
-    deg_df = pd.DataFrame(deg)
-    # Rename base column
-    deg_df = deg_df.rename(columns={'G1 E@POI (MWh)':'Base E@POI (MWh)'})
+        deg.append({'Year': yr,
+                    'SOH (%)':           round(s_yr*100, 2),
+                    'Base E@POI (MWh)':  round(e_group_bol[0]*s_yr, 1),
+                    'Aug E added (MWh)': round(aug_event, 1),
+                    'Total E@POI (MWh)': round(e_tot, 1)})
+    deg_df = pd.DataFrame(deg,
+        columns=['Year','SOH (%)','Base E@POI (MWh)','Aug E added (MWh)','Total E@POI (MWh)'])
 
     # ── 3 Checks ─────────────────────────────────────────────────────────────
     q_poi_target   = poi_mw * np.tan(np.arccos(target_pf))
@@ -597,21 +597,51 @@ if run_btn:
             st.warning("Power flow did not converge. Check tap position.")
 
     with t2:
-        fig2=go.Figure()
-        fig2.add_hline(y=poi_mwh,line_dash='dash',line_color='red',annotation_text=f"Target {poi_mwh:.0f} MWh")
-        fig2.add_trace(go.Scatter(x=res['deg_df']['Year'],y=res['deg_df']['Total E@POI (MWh)'],
-            mode='lines+markers',name='Total E@POI',line=dict(color='royalblue',width=2.5),marker=dict(size=6)))
-        fig2.add_trace(go.Scatter(x=res['deg_df']['Year'],y=res['deg_df']['Base E@POI (MWh)'],
-            mode='lines',name='Base only',line=dict(color='lightblue',width=1.5,dash='dot')))
-        aug_rows=res['deg_df'][res['deg_df']['Aug E added (MWh)']>0]
+        fig2 = go.Figure()
+        fig2.add_hline(y=poi_mwh, line_dash='dash', line_color='red', line_width=1.5,
+                       annotation_text=f"Target {poi_mwh:.0f} MWh", annotation_position="top left")
+        fig2.add_hrect(y0=0, y1=poi_mwh, fillcolor='#fee2e2', opacity=0.06, line_width=0)
+
+        # Total energy (solid)
+        fig2.add_trace(go.Scatter(
+            x=res['deg_df']['Year'], y=res['deg_df']['Total E@POI (MWh)'],
+            mode='lines+markers', name='Total E @ POI',
+            line=dict(color='royalblue', width=2.5), marker=dict(size=6)))
+
+        # Base group only (dotted) when there are secondary groups
+        if len(res['groups_act']) > 1:
+            fig2.add_trace(go.Scatter(
+                x=res['deg_df']['Year'], y=res['deg_df']['Base E@POI (MWh)'],
+                mode='lines', name=f"G1 only ({res['groups_act'][0][0]}×{res['groups_act'][0][1]} BESS)",
+                line=dict(color='lightblue', width=1.5, dash='dot')))
+
+        # Augmentation bar
+        aug_rows = res['deg_df'][res['deg_df']['Aug E added (MWh)'] > 0]
         if len(aug_rows):
-            fig2.add_trace(go.Bar(x=aug_rows['Year'],y=aug_rows['Aug E added (MWh)'],
-                name='Augmentation added',marker_color='#16a34a',opacity=.7))
-        fig2.update_layout(title="Energy @ POI over Project Life",
-            xaxis_title="Year",yaxis_title="MWh",height=380)
-        st.plotly_chart(fig2,use_container_width=True)
-        st.dataframe(res['deg_df'].set_index('Year'),use_container_width=True)
-        st.download_button("⬇ Degradation CSV",res['deg_df'].to_csv(index=False),"degradation.csv","text/csv")
+            fig2.add_trace(go.Bar(
+                x=aug_rows['Year'], y=aug_rows['Aug E added (MWh)'],
+                name='Aug energy added', marker_color='#16a34a', opacity=0.8,
+                text=[f"+{v:.0f} MWh" for v in aug_rows['Aug E added (MWh)']],
+                textposition='outside'))
+
+        cfg_str = ' + '.join(f'{n}×{u}batt' for n,u in res['groups_act'])
+        fig2.update_layout(
+            title=f"Energy @ POI — {cfg_str}",
+            xaxis_title="Year", yaxis_title="MWh @ POI",
+            yaxis=dict(rangemode='tozero'), barmode='overlay',
+            height=400, legend=dict(x=0.01, y=0.99))
+        st.plotly_chart(fig2, use_container_width=True)
+
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("E @ BOL", f"{res['e_poi_bol']:.1f} MWh")
+        m2.metric("Overbuild", f"{res['overbuild_pct']:+.1f}%")
+        m3.metric("Yrs ≥ target", str(res['overbuild_years']))
+        yr_drop = next((r['Year'] for r in res['deg_df'].to_dict('records')
+                        if r['Total E@POI (MWh)'] < poi_mwh), "Never")
+        m4.metric("First yr < target", str(yr_drop))
+
+        st.dataframe(res['deg_df'].set_index('Year'), use_container_width=True)
+        st.download_button("⬇ Degradation CSV", res['deg_df'].to_csv(index=False), "degradation.csv","text/csv")
 
     with t3:
         glabels = ["Base","Aug/Partial","Extra"]
