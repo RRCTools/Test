@@ -1,10 +1,18 @@
 """
-BESS Sizing Tool v3 — correct augmentation logic
-Augmentation strategy:
-  - n_base = max(n_power, ceil(poi_mwh / (block_mwh * SOH[aug_year])))
-  - All n_base+n_aug PCS installed at BOL for power/reactive compliance
-  - Base blocks fully loaded; aug blocks partially loaded (aug_units_bol batteries)
-  - At aug_year: fill aug blocks to full battery complement
+BESS Sizing Tool v4 — Auto-Sizing Architecture
+
+User inputs:
+  - Project requirements (MW, MWh, PF, voltage)
+  - Equipment specs (Inverter MVA, MVT MVA, battery MWh/unit)
+  - Overbuild % (controls initial installed energy)
+  - Augmentation year
+
+Tool outputs:
+  - Required PCS qty and BESS enclosure qty
+  - Operating PF at PCS output
+  - PV curve from power flow
+  - Energy degradation with overbuild and augmentation
+  - Multiple config options (different BESS/PCS ratios)
 """
 import streamlit as st
 import numpy as np
@@ -27,20 +35,18 @@ div[data-testid="stSidebarContent"] span{color:#c9d1d9 !important;}
      letter-spacing:.12em;text-transform:uppercase;color:#58a6ff;
      border-bottom:1px solid #21262d;padding-bottom:2px;
      margin-top:12px;margin-bottom:4px;}
-.ok  {color:#3fb950;font-weight:700;}
-.fail{color:#f85149;font-weight:700;}
-.aug-box{background:#0f2c1a;border:1px solid #238636;border-radius:6px;
-         padding:10px 14px;margin:6px 0;font-size:.85rem;}
-.base-box{background:#0c1929;border:1px solid #1f6feb;border-radius:6px;
-          padding:10px 14px;margin:6px 0;font-size:.85rem;}
+.card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;margin:4px 0;}
+.cfg-head{font-family:'IBM Plex Mono',monospace;font-size:.8rem;font-weight:600;color:#1e40af;margin-bottom:4px;}
+.ok{color:#16a34a;font-weight:700;} .fail{color:#dc2626;font-weight:700;}
+.warn{color:#d97706;font-weight:700;}
 </style>
 """, unsafe_allow_html=True)
 
-DEFAULT_SOH = [1.0000,0.9342,0.9115,0.8933,0.8775,0.8633,0.8502,
-               0.8381,0.8266,0.8158,0.8054,0.7955,0.7859,0.7767,
-               0.7677,0.7590,0.7506,0.7424,0.7343,0.7265,0.7188]
+DEFAULT_SOH = [1.0,0.9342,0.9115,0.8933,0.8775,0.8633,0.8502,0.8381,
+               0.8266,0.8158,0.8054,0.7955,0.7859,0.7767,0.7677,0.759,
+               0.7506,0.7424,0.7343,0.7265,0.7188]
 
-# ── 3-BUS NR POWER FLOW ──────────────────────────────────────────────────────
+# ── 3-BUS POWER FLOW ─────────────────────────────────────────────────────────
 def build_ybus(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,tap_c,q_cap=0.):
     rm=mpt_z*np.cos(np.arctan(mpt_xr)); xm=mpt_z*np.sin(np.arctan(mpt_xr))
     Ys=(mpt_s/sbase)/complex(rm,xm)
@@ -102,191 +108,170 @@ def run_pf_sweep(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,P
             V2p,V3p=V[1],V[2]
             P1=sum(V[0]*V[j]*(Y[0,j].real*np.cos(th[0]-th[j])+Y[0,j].imag*np.sin(th[0]-th[j])) for j in range(3))
             Q1=sum(V[0]*V[j]*(Y[0,j].real*np.sin(th[0]-th[j])-Y[0,j].imag*np.cos(th[0]-th[j])) for j in range(3))
-            rows.append({'P_inv_MW':P3*sbase,'Q_inv_MVAR':Q3*sbase,'V_POI':V[1],'V_ISU':V[2],'P_grid_MW':P1*sbase,'Q_grid_MVAR':Q1*sbase})
+            rows.append({'P_inv_MW':P3*sbase,'Q_inv_MVAR':Q3*sbase,'V_POI':V[1],'V_ISU':V[2],
+                         'P_grid_MW':P1*sbase,'Q_grid_MVAR':Q1*sbase})
     return pd.DataFrame(rows)
 
-# ── BESS SIZING ENGINE ────────────────────────────────────────────────────────
-def size_bess(poi_mw, poi_mwh, target_pf,
-              inv_mva, pcs_pf, groups, batt_mwh_dc, aux_kw_per_blk,
-              eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
-              eta_dc, eta_chg, eta_aux,
-              project_years, aug_year,
-              soh_curve, cap_mvar=0.):
+# ── SIZING ENGINE ─────────────────────────────────────────────────────────────
+def compute_eta(eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux):
+    return eta_pcs*eta_mvt*eta_mv*eta_mpt*eta_tx*eta_dc*eta_chg*eta_aux
+
+def size_config(poi_mw, poi_mwh, target_pf,
+                inv_mva, batt_per_pcs,
+                batt_mwh_dc, aux_kw_per_pcs,
+                eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux,
+                aug_year, overbuild_pct, project_years, soh_curve, cap_mvar=0.):
     """
-    groups = list of (n_pcs, units_per_pcs) tuples.
-    E.g. [(39,4),(5,2)] = 39 PCS×4 BESS + 5 PCS×2 BESS.
-    The engine uses these exact counts for energy/power.
-    Auto-sizing suggestion is also computed for comparison.
+    Auto-size PCS qty given a fixed batt_per_pcs ratio.
+    PCS operating PF is derived from the P/Q requirement (not a fixed input).
+    overbuild_pct: how much extra energy to install at BOL (e.g. 15% means
+                   E_installed = poi_mwh * (1 + overbuild_pct/100))
     """
-    eta_all = eta_pcs*eta_mvt*eta_mv*eta_mpt*eta_tx*eta_dc*eta_chg*eta_aux
+    eta_all = compute_eta(eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux)
     soh = soh_curve + [soh_curve[-1]]*(max(project_years+2-len(soh_curve),0))
 
-    # Base group config (group 1) drives power sizing
-    base_units   = groups[0][1] if groups else 4
-    blk_mwh_base = base_units * batt_mwh_dc * eta_all
+    # ── Q requirement at POI ──────────────────────────────────────────────────
+    q_poi_target = poi_mw * np.tan(np.arccos(target_pf))
 
-    # ── AUTO-SIZING (suggestion) ──────────────────────────────────────────────
-    n = 1
-    for _ in range(25):
-        aux_mw   = n * aux_kw_per_blk / 1000.
+    # ── POWER: find minimum n_pcs where P AND Q are both met ─────────────────
+    # At each n, operating PF = minimum PF to meet P (maximises Q headroom)
+    eta_q = eta_mvt * eta_mv * eta_mpt * eta_tx  # Q loss chain (no chg/dc)
+    n_pcs = 1
+    for _ in range(30):
+        aux_mw   = n_pcs * aux_kw_per_pcs / 1000.
         p_mpt_lv = poi_mw / (eta_mpt * eta_tx)
         p_mv     = p_mpt_lv + aux_mw
         p_mvt    = p_mv / eta_mv
         p_inv_nd = p_mvt / eta_mvt
-        n_new    = ceil(p_inv_nd / (inv_mva * pcs_pf))
-        if n_new == n: break
-        n = n_new
-    n_power = n
-    soh_aug  = soh[min(aug_year, len(soh)-1)] if aug_year > 0 else soh[min(project_years, len(soh)-1)]
-    n_energy = ceil(poi_mwh / (blk_mwh_base * soh_aug))
-    n_base_auto = max(n_power, n_energy)
+        pf_op    = p_inv_nd / (n_pcs * inv_mva)   # derived operating PF
+        if pf_op > 1.0:
+            n_pcs += 1
+            continue
+        # Check Q headroom at this n and pf
+        q_avail_poi = n_pcs * inv_mva * np.sqrt(max(1-pf_op**2,0)) * eta_q + cap_mvar * eta_mpt * eta_tx
+        p_meets = True   # by construction
+        q_meets = q_avail_poi >= q_poi_target - 0.01
+        if p_meets and q_meets:
+            break
+        n_pcs += 1
+    n_pcs_power = n_pcs
+
+    # ── ENERGY: size for overbuild target ────────────────────────────────────
+    # E_target_bol = poi_mwh * (1 + overbuild_pct/100)
+    # This ensures at aug_year, energy is still >= poi_mwh
+    e_target_bol = poi_mwh * (1.0 + overbuild_pct / 100.0)
+    blk_mwh_poi  = batt_per_pcs * batt_mwh_dc * eta_all
+    n_pcs_energy = ceil(e_target_bol / blk_mwh_poi)
+
+    n_pcs_base = max(n_pcs_power, n_pcs_energy)
+    n_batt_base = n_pcs_base * batt_per_pcs
+
+    # Derived operating PF at final n_pcs_base
+    aux_mw_final = n_pcs_base * aux_kw_per_pcs / 1000.
+    p_mpt_lv_f   = poi_mw / (eta_mpt * eta_tx)
+    p_mv_f       = p_mpt_lv_f + aux_mw_final
+    p_inv_nd_f   = (p_mv_f / eta_mv) / eta_mvt
+    pf_operating = min(p_inv_nd_f / (n_pcs_base * inv_mva), 1.0)
+
+    # ── AUGMENTATION ─────────────────────────────────────────────────────────
+    e_bol_base   = n_pcs_base * blk_mwh_poi
     if aug_year > 0:
-        e_at_aug  = n_base_auto * blk_mwh_base * soh_aug
-        n_aug_auto= ceil(max(poi_mwh - e_at_aug, 0.) / blk_mwh_base)
+        soh_at_aug   = soh[min(aug_year, len(soh)-1)]
+        e_at_aug     = e_bol_base * soh_at_aug
+        aug_gap      = max(poi_mwh - e_at_aug, 0.)
+        n_pcs_aug    = ceil(aug_gap / blk_mwh_poi) if aug_gap > 0 else 0
     else:
-        n_aug_auto = 0
+        soh_at_aug = soh[min(project_years, len(soh)-1)]
+        n_pcs_aug  = 0
+    n_batt_aug = n_pcs_aug * batt_per_pcs
 
-    # ── ACTUAL CONFIG from user groups ────────────────────────────────────────
-    groups_act  = [(n,u) for n,u in groups if n > 0] or [(1, base_units)]
-    total_pcs   = sum(n for n,_ in groups_act)
-    total_batt  = sum(n*u for n,u in groups_act)
-    e_dc_bol    = total_batt * batt_mwh_dc
-    e_poi_bol   = e_dc_bol * eta_all
+    # ── Actuals ───────────────────────────────────────────────────────────────
+    n_pcs_total  = n_pcs_base  # aug added later
+    e_dc_bol     = n_pcs_total * batt_per_pcs * batt_mwh_dc
+    e_poi_bol    = e_dc_bol * eta_all
+    overbuild_actual = (e_poi_bol - poi_mwh) / poi_mwh * 100
 
-    # Group 1 = base; rest = aug/secondary
-    n_base   = groups_act[0][0]
-    n_aug    = sum(n for n,_ in groups_act[1:])
-    n_batt_g = [(n*u) for n,u in groups_act]   # batteries per group
+    # Power cascade
+    aux_mw       = n_pcs_total * aux_kw_per_pcs / 1000.
+    p_inv_act    = n_pcs_total * inv_mva * pf_operating
+    q_inv_act    = n_pcs_total * inv_mva * np.sqrt(max(1-pf_operating**2,0))
+    s_inv_act    = n_pcs_total * inv_mva
+    p_mvt_out    = p_inv_act * eta_mvt; q_mvt_out = q_inv_act * eta_mvt
+    p_mv_bus     = p_mvt_out * eta_mv;  q_mv_bus  = q_mvt_out * eta_mv
+    p_mpt_in     = p_mv_bus - aux_mw;   q_mpt_in  = q_mv_bus + cap_mvar
+    p_poi        = p_mpt_in * eta_mpt * eta_tx
+    q_poi        = q_mpt_in * eta_mpt * eta_tx
+    s_poi        = np.sqrt(p_poi**2+q_poi**2)
+    pf_poi       = p_poi/s_poi if s_poi>0 else 1.
+    min_mpt_mva  = np.sqrt(p_mpt_in**2+q_mpt_in**2)
 
-    # ── Power cascade (total PCS) ─────────────────────────────────────────────
-    n_pcs_total = total_pcs
-    aux_mw_act  = n_pcs_total * aux_kw_per_blk / 1000.
-    p_inv_act   = n_pcs_total * inv_mva * pcs_pf
-    q_inv_act   = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0))
-    s_inv_act   = n_pcs_total * inv_mva
-    p_mvt_out   = p_inv_act * eta_mvt
-    q_mvt_out   = q_inv_act * eta_mvt
-    p_mv_bus    = p_mvt_out * eta_mv
-    q_mv_bus    = q_mvt_out * eta_mv
-    p_mpt_in    = p_mv_bus - aux_mw_act
-    q_mpt_in    = q_mv_bus + cap_mvar
-    p_poi       = p_mpt_in * eta_mpt * eta_tx
-    q_poi       = q_mpt_in * eta_mpt * eta_tx
-    s_poi       = np.sqrt(p_poi**2+q_poi**2)
-    pf_poi      = p_poi/s_poi if s_poi>0 else 1.
-    q_poi_need  = poi_mw * np.tan(np.arccos(target_pf))
-    s_mv_bus    = np.sqrt(p_mpt_in**2+q_mpt_in**2)
-    min_mpt_mva = s_mv_bus
+    # Q checks
+    q_avail_mvbus = n_pcs_total*inv_mva*np.sqrt(max(1-pf_operating**2,0))*eta_mvt*eta_mv + cap_mvar
+    q_needed_mvbus= q_poi_target*(q_mpt_in/q_poi) if q_poi>0.01 else q_poi_target/(eta_mpt*eta_tx)
 
-    # ── Degradation: each group degrades at same SOH curve ───────────────────
-    # Group 1 (base) installed at BOL; group 2+ treated as aug (installed at aug_year)
-    e_group_bol = [n*u*batt_mwh_dc*eta_all for n,u in groups_act]
-
+    # ── Degradation table ─────────────────────────────────────────────────────
+    e_base_bol = e_poi_bol
+    e_aug_bol  = n_pcs_aug * blk_mwh_poi
     deg = []
     for yr in range(project_years+1):
-        s_yr  = soh[min(yr, len(soh)-1)]
-        e_tot = 0.
-        aug_event = 0.
-        for gi, eg in enumerate(e_group_bol):
-            if gi == 0:
-                # Base group: installed at BOL, degrades from yr 0
-                e_tot += eg * s_yr
-            else:
-                # Secondary groups: installed at aug_year, degrade from aug_year
-                if aug_year > 0 and yr >= aug_year:
-                    s_rel  = soh[min(yr - aug_year, len(soh)-1)]
-                    e_tot += eg * s_rel
-                    if yr == aug_year:
-                        aug_event += eg
-        deg.append({'Year': yr,
-                    'SOH (%)':           round(s_yr*100, 2),
-                    'Base E@POI (MWh)':  round(e_group_bol[0]*s_yr, 1),
-                    'Aug E added (MWh)': round(aug_event, 1),
-                    'Total E@POI (MWh)': round(e_tot, 1)})
+        s_yr   = soh[min(yr, len(soh)-1)]
+        e_base = e_base_bol * s_yr
+        if aug_year > 0 and yr >= aug_year:
+            s_rel  = soh[min(yr-aug_year, len(soh)-1)]
+            e_aug  = e_aug_bol * s_rel
+        else:
+            e_aug  = 0.
+        e_tot  = e_base + e_aug
+        aug_ev = round(e_aug_bol,1) if (aug_year>0 and yr==aug_year) else 0.
+        deg.append({'Year':yr,'SOH (%)':round(s_yr*100,2),
+                    'Base E@POI (MWh)':round(e_base,1),
+                    'Aug E added (MWh)':aug_ev,
+                    'Total E@POI (MWh)':round(e_tot,1)})
     deg_df = pd.DataFrame(deg,
         columns=['Year','SOH (%)','Base E@POI (MWh)','Aug E added (MWh)','Total E@POI (MWh)'])
 
-    # ── 3 Checks ─────────────────────────────────────────────────────────────
-    q_poi_target   = poi_mw * np.tan(np.arccos(target_pf))
-    q_actual_mvbus = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0)) * eta_mvt * eta_mv + cap_mvar
-    q_needed_mvbus = q_poi_target * (q_mpt_in/q_poi) if q_poi > 0.01 else q_poi_target/max(eta_mpt*eta_tx,0.01)
-
-    overbuild_years = 0
-    e_base_bol = e_group_bol[0]
-    for _yr in range(project_years+1):
-        if e_base_bol * soh[min(_yr, len(soh)-1)] >= poi_mwh:
-            overbuild_years = _yr
-    overbuild_pct = (e_poi_bol - poi_mwh) / poi_mwh * 100
-
-    # ── Cascade dict for SLD ─────────────────────────────────────────────────
-    def pf_(p,q): return p/np.sqrt(p**2+q**2) if np.sqrt(p**2+q**2)>0 else 1.
-    cascade = {
-        'Inverter\nOutput': {'P':p_inv_act,'Q':q_inv_act,'S':s_inv_act,'PF':pcs_pf},
-        'MVT\nOutput':      {'P':p_mvt_out,'Q':q_mvt_out,'S':np.sqrt(p_mvt_out**2+q_mvt_out**2),'PF':pf_(p_mvt_out,q_mvt_out)},
-        'MV Bus\n(−Aux)':   {'P':p_mpt_in, 'Q':q_mpt_in, 'S':s_mv_bus,'PF':pf_(p_mpt_in,q_mpt_in)},
-        'POI':              {'P':p_poi,     'Q':q_poi,     'S':s_poi,   'PF':pf_poi},
-    }
+    # First year below target
+    yr_below = next((r['Year'] for r in deg if r['Total E@POI (MWh)'] < poi_mwh), None)
 
     return {
-        # User groups
-        'groups_act': groups_act,
-        'n_batt_g':   n_batt_g,
-        # Summary quantities
-        'n_base':n_base,'n_aug':n_aug,'n_pcs':n_pcs_total,
-        'n_batt_bol':total_batt, 'n_batt_aug': sum(n*u for n,u in groups_act[1:]),
-        'base_units':base_units,
-        # Auto-sizing suggestion
-        'n_base_auto':n_base_auto,'n_aug_auto':n_aug_auto,
-        'n_power':n_power,'n_energy':n_energy,
-        # Power
-        'p_poi':p_poi,'q_poi':q_poi,'s_inv':s_inv_act,
-        'min_mpt_mva':min_mpt_mva,'aux_mw':aux_mw_act,
-        'p_mv_bus':p_mv_bus,'q_mv_bus':q_mv_bus,
-        'p_mpt_in':p_mpt_in,'q_mpt_in':q_mpt_in,
-        'p_inv_nd':p_inv_nd, 'p_loss_pct':(1-eta_all)*100,
-        # Energy
+        'n_pcs_base':n_pcs_base,'n_batt_base':n_batt_base,
+        'n_pcs_aug':n_pcs_aug,  'n_batt_aug':n_batt_aug,
+        'batt_per_pcs':batt_per_pcs,
+        'pf_operating':pf_operating, 'pf_poi':pf_poi,
+        'p_poi':p_poi,'q_poi':q_poi,'s_poi':s_poi,
+        'p_inv_nd':p_inv_nd_f,
+        'n_pcs_power':n_pcs_power,'n_pcs_energy':n_pcs_energy,
+        'driver':'POWER' if n_pcs_power>=n_pcs_energy else 'ENERGY',
         'e_poi_bol':e_poi_bol,'e_dc_bol':e_dc_bol,
-        # 3 Checks (Excel R29-R31)
-        'check1_energy':   e_poi_bol >= poi_mwh * 0.999,
-        'check2_power':    p_poi >= poi_mw * 0.999,
-        'check3_reactive': q_actual_mvbus >= q_needed_mvbus * 0.999,
-        'q_actual_mvbus':  q_actual_mvbus,
-        'q_needed_mvbus':  q_needed_mvbus,
-        'q_poi_target':    q_poi_target,
-        'overbuild_pct':   overbuild_pct,
-        'overbuild_years': overbuild_years,
-        # Legacy
-        'p_meets':p_poi>=poi_mw*.999,'e_meets':e_poi_bol>=poi_mwh*.999,
-        'q_meets':q_actual_mvbus>=q_needed_mvbus*.999,'q_poi_need':q_poi_target,
-        # Drivers
-        'blk_mwh_base':blk_mwh_base,'eta_all':eta_all,'soh_aug':soh_aug,
-        # Tables
-        'cascade':cascade,'deg_df':deg_df,
+        'overbuild_actual':overbuild_actual,
+        'min_mpt_mva':min_mpt_mva,
+        'p_mpt_in':p_mpt_in,'q_mpt_in':q_mpt_in,
+        'aux_mw':aux_mw,'eta_all':eta_all,
+        'blk_mwh_poi':blk_mwh_poi,
+        'soh_at_aug':soh_at_aug,
+        # Checks
+        'check1_energy': e_poi_bol >= poi_mwh*0.999,
+        'check2_power':  p_poi >= poi_mw*0.999,
+        'check3_reactive': q_avail_mvbus >= q_needed_mvbus*0.999,
+        'q_poi_target':q_poi_target,'q_avail_mvbus':q_avail_mvbus,'q_needed_mvbus':q_needed_mvbus,
+        'yr_below':yr_below,
+        'deg_df':deg_df,
     }
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🔋 BESS Sizing")
 
     st.markdown('<div class="sec">Project</div>', unsafe_allow_html=True)
     proj_name = st.text_input("", value="Demo BESS", label_visibility="collapsed")
-    iso = st.selectbox("ISO", ["WECC","CAISO","ERCOT","PJM","MISO","NYISO","ISO-NE","Other"])
+    iso = st.selectbox("ISO",["WECC","CAISO","ERCOT","PJM","MISO","NYISO","ISO-NE","Other"])
 
     st.markdown('<div class="sec">POI Requirements</div>', unsafe_allow_html=True)
-    poi_mw   = st.number_input("Power @ POI (MW)",  value=200., min_value=1., step=10.)
+    poi_mw   = st.number_input("Power @ POI (MW)",   value=200., min_value=1., step=10.)
     poi_mwh  = st.number_input("Energy @ POI (MWh)", value=800., min_value=1., step=50.)
     poi_lim  = st.number_input("Export Limit (MW)",  value=200., min_value=1., step=10.)
-    proj_yrs = st.number_input("Project Term (yr)",  value=20,  min_value=1, max_value=40)
-
-    st.markdown('<div class="sec">Augmentation</div>', unsafe_allow_html=True)
-    aug_year = st.number_input("Augmentation Year (0=none)", value=5, min_value=0, max_value=40,
-        help="Year when aug batteries are added. Base blocks sized to sustain until this year.")
-    # aug blocks are fully new PCS+batteries added at aug_year (no partial pre-install)
-
-    st.markdown('<div class="sec">Reactive Power</div>', unsafe_allow_html=True)
-    pf_mode = st.radio("", ["Target PF","Target MVAR"], horizontal=True, label_visibility="collapsed")
+    proj_yrs = st.number_input("Project Term (yr)",  value=20, min_value=1, max_value=40)
+    pf_mode  = st.radio("", ["Target PF","Target MVAR"], horizontal=True, label_visibility="collapsed")
     if pf_mode=="Target PF":
         target_pf = st.number_input("Target PF @ POI", value=0.95, min_value=0.5, max_value=1., step=.01)
         st.caption(f"Q = {poi_mw*np.tan(np.arccos(target_pf)):.1f} MVAR")
@@ -296,15 +281,24 @@ with st.sidebar:
         st.caption(f"PF = {target_pf:.3f}")
     cap_bank = st.number_input("Capacitor Bank (MVAR)", value=0., min_value=0., step=5.)
 
+    st.markdown('<div class="sec">Energy Strategy</div>', unsafe_allow_html=True)
+    overbuild_pct = st.number_input(
+        "Overbuild % at BOL", value=15.0, min_value=0., max_value=100., step=1.,
+        help="Extra energy installed above nameplate so degradation reaches target at aug_year. "
+             "E_installed = poi_mwh × (1 + overbuild%/100)")
+    aug_year = st.number_input("Augmentation Year (0=none)", value=10, min_value=0, max_value=40,
+        help="Year when aug PCS+batteries are added. Sized to restore to poi_mwh target.")
+    st.caption(f"E_BOL target = {poi_mwh*(1+overbuild_pct/100):.0f} MWh  "
+               f"({'reaches target at aug yr' if aug_year>0 else 'must survive full term'})")
+
     st.markdown('<div class="sec">Grid / MPT</div>', unsafe_allow_html=True)
-    c1,c2 = st.columns(2)
-    n_mpt=c1.number_input("#MPTs",   value=1,     min_value=1)
-    s_mpt=c2.number_input("MVA/MPT", value=240.,  min_value=10., step=10.)
-    c3,c4 = st.columns(2)
+    c1,c2=st.columns(2)
+    n_mpt=c1.number_input("#MPTs",   value=1,    min_value=1)
+    s_mpt=c2.number_input("MVA/MPT", value=240., min_value=10., step=10.)
+    c3,c4=st.columns(2)
     z_mpt =c3.number_input("Z(pu)",  value=0.10, min_value=.01, step=.005, format="%.3f")
     xr_mpt=c4.number_input("X/R",    value=40.,  min_value=1.)
-    eta_mpt=st.number_input("MPT η", value=0.995, min_value=.9, max_value=1., step=.001, format="%.3f")
-
+    eta_mpt=st.number_input("MPT η",  value=0.995, min_value=.9, max_value=1., step=.001, format="%.3f")
     has_oltc=st.checkbox("OLTC?", value=True)
     if has_oltc:
         c5,c6=st.columns(2)
@@ -316,60 +310,22 @@ with st.sidebar:
     else:
         tap_c=st.number_input("Fixed tap(pu)", value=0., step=.005, format="%.3f")
 
-    st.markdown('<div class="sec">PCS / Inverter</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec">PCS / MVT Specs</div>', unsafe_allow_html=True)
     pcs_model=st.text_input("PCS Model", value="EPC POWER M10")
     c7,c8=st.columns(2)
     inv_mva=c7.number_input("Inv MVA",  value=5.3, min_value=.1, step=.1)
     mvt_mva=c8.number_input("MVT MVA",  value=5.3, min_value=.1, step=.1)
-    pcs_pf =st.number_input("PCS Operating PF", value=0.90, min_value=.5, max_value=1., step=.01,
-        help="Sets the P/Q split per block. Drives the power constraint.")
     eta_pcs=st.number_input("PCS η", value=0.985, min_value=.8, max_value=1., step=.001, format="%.3f")
 
     st.markdown('<div class="sec">Battery Unit</div>', unsafe_allow_html=True)
-    batt_model = st.text_input("Battery Model", value="BESS Unit")
-    batt_mwh   = st.number_input("MWh / unit (DC)", value=6.138, min_value=.1, step=.1, format="%.3f")
-    aux_kw     = st.number_input("Aux load / block (kW)", value=75.6, min_value=0., step=1.)
+    batt_model=st.text_input("Battery Model", value="BESS Unit")
+    batt_mwh  =st.number_input("MWh/unit (DC)", value=6.138, min_value=.1, step=.1, format="%.3f")
+    aux_kw    =st.number_input("Aux load/PCS (kW)", value=75.6, min_value=0., step=1.)
 
-    st.markdown('<div class="sec">PCS → Battery Groups</div>', unsafe_allow_html=True)
-    st.caption("Define 1–3 groups. Each group: N PCS blocks, each with K batteries.")
-    st.markdown('<div style="font-size:.72rem;color:#8b949e;margin-bottom:6px">Example: 39×4 + 5×2</div>', unsafe_allow_html=True)
-
-    n_groups = int(st.number_input("Number of groups", value=1, min_value=1, max_value=3, step=1))
-    group_colors = ["#1f6feb","#238636","#9e6a03"]
-    group_labels = ["Base","Aug/Partial","Extra"]
-    group_defaults_n = [44, 0, 0]
-    group_defaults_u = [4, 2, 4]
-
-    groups = []
-    for g in range(n_groups):
-        st.markdown(
-            f'<div style="border-left:3px solid {group_colors[g]};padding:2px 0 2px 8px;'
-            f'margin:4px 0;font-size:.78rem;color:#c9d1d9"><b>Group {g+1} — {group_labels[g]}</b></div>',
-            unsafe_allow_html=True)
-        gc1, gc2 = st.columns(2)
-        gn = gc1.number_input(f"# PCS", value=group_defaults_n[g], min_value=0, key=f"gn{g}",
-                               label_visibility="visible")
-        gu = gc2.number_input(f"BESS/PCS", value=group_defaults_u[g], min_value=0, max_value=20, key=f"gu{g}",
-                               label_visibility="visible")
-        groups.append((int(gn), int(gu)))
-
-    # Always ensure at least one group with PCS > 0
-    groups_active = [(n,u) for n,u in groups if n > 0]
-    if not groups_active:
-        groups_active = [(1, 4)]
-
-    total_pcs  = sum(n for n,_ in groups_active)
-    total_batt = sum(n*u for n,u in groups_active)
-    total_dc   = total_batt * batt_mwh
-    st.caption(f"PCS: **{total_pcs}** | Batteries: **{total_batt}** | DC: **{total_dc:.1f} MWh**")
-
-    # base_units = batteries per PCS in group 1 (used by power sizing engine)
-    base_units = groups_active[0][1]
-
-    st.markdown('<div class="sec">MVT/ISU</div>', unsafe_allow_html=True)
-    c11,c12=st.columns(2)
-    z_isu =c11.number_input("Z(pu)",  value=0.08, min_value=.01, step=.005, format="%.3f")
-    xr_isu=c12.number_input("X/R",    value=8.83, min_value=1.)
+    st.markdown('<div class="sec">MVT / ISU</div>', unsafe_allow_html=True)
+    c9,c10=st.columns(2)
+    z_isu =c9.number_input("Z(pu)",   value=0.08, min_value=.01, step=.005, format="%.3f")
+    xr_isu=c10.number_input("X/R ISU",value=8.83, min_value=1.)
     eta_mvt=st.number_input("MVT η",  value=0.990, min_value=.8, max_value=1., step=.001, format="%.3f")
 
     st.markdown('<div class="sec">Loss Factors</div>', unsafe_allow_html=True)
@@ -378,341 +334,317 @@ with st.sidebar:
         eta_tx  =st.number_input("Transmission",value=.990, min_value=.9, max_value=1., step=.001, format="%.3f")
         eta_aux =st.number_input("Auxiliary",   value=.998, min_value=.9, max_value=1., step=.001, format="%.3f")
     with st.expander("DC losses"):
-        eta_dc  =st.number_input("DC Cable",       value=.999, min_value=.9, max_value=1., step=.001, format="%.3f")
-        eta_chg =st.number_input("Charge/Disch",   value=.955, min_value=.8, max_value=1., step=.001, format="%.3f")
+        eta_dc  =st.number_input("DC Cable",        value=.999, min_value=.9, max_value=1., step=.001, format="%.3f")
+        eta_chg =st.number_input("Charge/Discharge", value=.955, min_value=.8, max_value=1., step=.001, format="%.3f")
 
-    st.markdown('<div class="sec">SOH Degradation Curve</div>', unsafe_allow_html=True)
-    with st.expander("Edit SOH by year"):
+    st.markdown('<div class="sec">BESS/PCS Ratios to Evaluate</div>', unsafe_allow_html=True)
+    st.caption("Tool will size PCS qty for each ratio and show all options")
+    ratios_str = st.text_input("BESS units per PCS (comma-separated)", value="2, 3, 4, 5, 6")
+    try:
+        bess_ratios = [int(x.strip()) for x in ratios_str.split(',') if x.strip().isdigit() and int(x.strip())>0]
+    except:
+        bess_ratios = [2,3,4,5,6]
+
+    st.markdown('<div class="sec">SOH Degradation</div>', unsafe_allow_html=True)
+    with st.expander("Edit SOH curve"):
         soh_vals=[]
         for yr in range(min(int(proj_yrs)+1,21)):
             dv=DEFAULT_SOH[yr] if yr<len(DEFAULT_SOH) else DEFAULT_SOH[-1]
             r1,r2=st.columns([1,2])
-            r1.markdown(f"<div style='padding-top:8px;font-size:.82rem'>Yr {yr}</div>",unsafe_allow_html=True)
+            r1.markdown(f"<div style='padding-top:8px;font-size:.8rem'>Yr {yr}</div>",unsafe_allow_html=True)
             v=r2.number_input(f"s{yr}",value=float(round(dv*100,2)),min_value=0.,max_value=100.,
                               step=.1,label_visibility="collapsed",key=f"soh{yr}")
             soh_vals.append(v/100.)
     soh_curve=soh_vals
 
-    st.divider()
-    run_btn=st.button("▶  Run Sizing", type="primary", use_container_width=True)
-    v_min_pf=st.number_input("V min (pu)",value=.95,min_value=.8,max_value=1.,step=.01)
-    v_max_pf=st.number_input("V max (pu)",value=1.05,min_value=1.,max_value=1.15,step=.01)
-    v_calc  =st.number_input("V calc(pu)",value=1.00,min_value=.8,max_value=1.15,step=.01)
+    st.markdown('<div class="sec">POI Voltage Limits</div>', unsafe_allow_html=True)
+    ca,cb,cc=st.columns(3)
+    v_min=ca.number_input("Min",  value=.95, min_value=.8, max_value=1.,  step=.01)
+    v_max=cb.number_input("Max",  value=1.05,min_value=1., max_value=1.15,step=.01)
+    v_calc=cc.number_input("Calc",value=1.00,min_value=.8, max_value=1.15,step=.01)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HEADER
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown(f"# 🔋 BESS Sizing Tool")
-st.caption(f"**{proj_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ POI")
+    st.divider()
+    run_btn=st.button("▶  Size All Configurations", type="primary", use_container_width=True)
+
+# ── HEADER ────────────────────────────────────────────────────────────────────
+st.markdown("# 🔋 BESS Sizing Tool")
+st.caption(f"**{proj_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ POI · "
+           f"PF {target_pf:.2f} · {overbuild_pct:.0f}% overbuild · aug yr {int(aug_year)}")
 st.divider()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RUN
-# ══════════════════════════════════════════════════════════════════════════════
+# ── RUN ───────────────────────────────────────────────────────────────────────
 if run_btn:
-    with st.spinner("Sizing…"):
-        res = size_bess(
-            poi_mw, poi_mwh, target_pf,
-            inv_mva, pcs_pf, groups_active, batt_mwh, aux_kw,
-            eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
-            eta_dc, eta_chg, eta_aux,
-            int(proj_yrs), int(aug_year),
-            soh_curve, float(cap_bank)
-        )
+    eta_all_ref = compute_eta(eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux)
 
-    # ── Equipment quantities ─────────────────────────────────────────────────
-    st.subheader("📦 Equipment Quantities")
+    with st.spinner(f"Sizing {len(bess_ratios)} configurations…"):
+        results = {}
+        for ratio in bess_ratios:
+            results[ratio] = size_config(
+                poi_mw, poi_mwh, target_pf,
+                inv_mva, ratio, batt_mwh, aux_kw,
+                eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux,
+                int(aug_year), float(overbuild_pct), int(proj_yrs), soh_curve, float(cap_bank))
 
-    # Group breakdown boxes
-    group_colors = ["#1f6feb","#238636","#9e6a03"]
-    group_labels = ["Base Build","Aug / Partial","Extra"]
-    for gi, (gn, gu) in enumerate(res['groups_act']):
-        gbatts = res['n_batt_g'][gi]
-        ge_dc  = gbatts * batt_mwh
-        ge_poi = ge_dc * res['eta_all']
-        tag    = group_labels[gi] if gi < len(group_labels) else f"Group {gi+1}"
-        install_note = "Day 1" if gi == 0 else (f"Year {int(aug_year)}" if int(aug_year) > 0 else "Day 1")
-        bg    = ["#0c1929","#0f2c1a","#2c2000"][gi % 3]
-        brd   = group_colors[gi % len(group_colors)]
-        html  = (
-            f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;'
-            f'padding:10px 14px;margin:4px 0;font-size:.85rem">'
-            f'<b>{'🏗' if gi==0 else '🔄'} Group {gi+1} — {tag}</b> &nbsp;'
-            f'<span style="font-size:.72rem;color:#8b949e">({install_note})</span><br>'
-            f'<b>{gn}</b> PCS × <b>{gu}</b> batteries = <b>{gbatts}</b> units | '
-            f'DC: <b>{ge_dc:.1f}</b> MWh | E@POI: <b>{ge_poi:.1f}</b> MWh'
-            f'</div>'
-        )
-        st.markdown(html, unsafe_allow_html=True)
+    # ── COMPARISON TABLE ──────────────────────────────────────────────────────
+    st.subheader("📊 Configuration Comparison")
 
-    # Auto-sizing suggestion
-    if res['n_base_auto'] != res['n_base'] or res['n_aug_auto'] != res['n_aug']:
-        st.markdown(
-            f'<div style="background:#1a1a2e;border:1px solid #553c9a;border-radius:6px;'
-            f'padding:8px 12px;margin:4px 0;font-size:.80rem;color:#c9d1d9">'
-            f'💡 <b>Auto-sizing suggests:</b> {res["n_base_auto"]} base PCS × {base_units} batteries'
-            f'{f" + {res["n_aug_auto"]} aug PCS" if res["n_aug_auto"]>0 else ""}'
-            f'</div>',
-            unsafe_allow_html=True
-        )
+    cmp_rows = []
+    for ratio, r in results.items():
+        c1ok = "✅" if r['check1_energy'] else "❌"
+        c2ok = "✅" if r['check2_power']  else "❌"
+        c3ok = "✅" if r['check3_reactive'] else "❌"
+        all_ok = r['check1_energy'] and r['check2_power'] and r['check3_reactive']
+        mpt_ok = n_mpt*s_mpt >= r['min_mpt_mva']
+        cmp_rows.append({
+            'BESS/PCS': ratio,
+            'PCS (base)': r['n_pcs_base'],
+            'BESS (base)': r['n_batt_base'],
+            'PCS (aug)': r['n_pcs_aug'],
+            'BESS (aug)': r['n_batt_aug'],
+            'PCS op. PF': round(r['pf_operating'],3),
+            'PF @ POI': round(r['pf_poi'],3),
+            'P @ POI (MW)': round(r['p_poi'],1),
+            'Q @ POI (MVAR)': round(r['q_poi'],1),
+            'E BOL (MWh)': round(r['e_poi_bol'],1),
+            'Overbuild %': round(r['overbuild_actual'],1),
+            'Yr < target': r['yr_below'] if r['yr_below'] else '—',
+            'Min MPT (MVA)': round(r['min_mpt_mva'],1),
+            'MPT OK': '✅' if mpt_ok else '❌',
+            'P✅ Q✅ E✅': '✅ ALL PASS' if all_ok else f"{c2ok}P {c1ok}E {c3ok}Q",
+            'Driver': r['driver'],
+        })
+    cmp_df = pd.DataFrame(cmp_rows).set_index('BESS/PCS')
+    st.dataframe(cmp_df, use_container_width=True)
 
-    q1,q2,q3,q4,q5 = st.columns(5)
-    q1.metric("Total PCS (BOL)", str(res['n_pcs']),
-              help=f"n_base={res['n_base']} + n_aug={res['n_aug']}")
-    q2.metric("Batteries @ BOL", str(res['n_batt_bol']))
-    q3.metric("Batteries @ Aug", str(res['n_batt_aug']),
-              delta=f"Year {aug_year}" if aug_year>0 else "None")
-    q4.metric("Min MPT MVA", f"{res['min_mpt_mva']:.1f}",
-              delta=f"{'OK' if n_mpt*s_mpt>=res['min_mpt_mva'] else 'UNDERSIZE'}")
-    q5.metric("BOL overbuild", f"{res['overbuild_pct']:+.1f}%")
+    # Highlight best (all checks pass, fewest total BESS units)
+    passing = [(r, results[r]['n_batt_base']+results[r]['n_batt_aug'])
+               for r in bess_ratios
+               if results[r]['check1_energy'] and results[r]['check2_power'] and results[r]['check3_reactive']]
+    if passing:
+        best_ratio = min(passing, key=lambda x: x[1])[0]
+        st.success(f"✅ Most efficient passing config: **{best_ratio} BESS/PCS** — "
+                   f"{results[best_ratio]['n_pcs_base']} PCS × {best_ratio} batteries = "
+                   f"{results[best_ratio]['n_batt_base']} units | "
+                   f"PCS PF = {results[best_ratio]['pf_operating']:.3f}")
+    else:
+        st.warning("⚠️ No configuration passes all 3 checks. Adjust inputs or increase PCS/BESS counts.")
 
     st.divider()
 
-    # ── Checks ──────────────────────────────────────────────────────────────
-    st.subheader("✅ Sizing Checks")
+    # ── DETAIL VIEW ───────────────────────────────────────────────────────────
+    st.subheader("🔍 Detail View")
+    sel_ratio = st.selectbox(
+        "Select configuration to inspect",
+        options=bess_ratios,
+        format_func=lambda r: f"{r} BESS/PCS → {results[r]['n_pcs_base']} PCS × {r} = {results[r]['n_batt_base']} batteries",
+        index=bess_ratios.index(best_ratio) if passing else 0)
+    res = results[sel_ratio]
 
-    def check_card(col, num, title, ok, actual, required, note=""):
-        bg  = "#0d3321" if ok else "#3d1a1a"
-        brd = "#238636" if ok else "#b62324"
-        tc  = "#3fb950" if ok else "#f85149"
-        sym = "✓" if ok else "✗"
-        nh  = f'<div style="font-size:.70rem;color:#8b949e;margin-top:3px">{note}</div>' if note else ""
-        html = (
-            f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;padding:10px 12px;margin-bottom:4px">'
-            f'<div style="font-family:monospace;font-size:.65rem;color:#8b949e;letter-spacing:.1em">CHECK {num}</div>'
-            f'<div style="font-size:.92rem;font-weight:700;color:{tc}">{sym} {title}</div>'
+    # Checks
+    def check_card(col,num,title,ok,actual,required,note=""):
+        bg="#0d3321" if ok else "#3d1a1a"; brd="#238636" if ok else "#b62324"
+        tc="#3fb950" if ok else "#f85149"; sym="✓" if ok else "✗"
+        nh=f'<div style="font-size:.70rem;color:#8b949e;margin-top:3px">{note}</div>' if note else ""
+        col.markdown(
+            f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;padding:10px 12px">'
+            f'<div style="font-family:monospace;font-size:.65rem;color:#8b949e">CHECK {num}</div>'
+            f'<div style="font-size:.9rem;font-weight:700;color:{tc}">{sym} {title}</div>'
             f'<div style="font-size:.80rem;color:#c9d1d9">Actual: <b>{actual}</b></div>'
             f'<div style="font-size:.80rem;color:#c9d1d9">Required: <b>{required}</b></div>'
-            f'{nh}</div>'
-        )
-        col.markdown(html, unsafe_allow_html=True)
+            f'{nh}</div>', unsafe_allow_html=True)
 
-    bc = st.columns(4)
-    check_card(bc[0], "2", "Active Power (R30)",
-        ok=res['check2_power'],
-        actual=f"{res['p_poi']:.2f} MW @ POI",
-        required=f"{poi_mw:.1f} MW",
-        note=f"Loss chain: {res['p_loss_pct']:.1f}%")
-
-    check_card(bc[1], "1", "Energy / Overbuild (R29)",
-        ok=res['check1_energy'],
-        actual=f"{res['e_poi_bol']:.1f} MWh @ BOL",
-        required=f"{poi_mwh:.0f} MWh",
-        note=f"Overbuild: {res['overbuild_pct']:+.1f}%  |  Yrs above target: {res['overbuild_years']}")
-
-    check_card(bc[2], "3", "Reactive FERC 827 (R31)",
-        ok=res['check3_reactive'],
-        actual=f"{res['q_actual_mvbus']:.2f} MVAR @ MV bus",
-        required=f"{res['q_needed_mvbus']:.2f} MVAR @ MV bus",
-        note=f"POI target: {res['q_poi_target']:.2f} MVAR  |  PF {target_pf:.2f}")
-
-    mpt_ok = n_mpt*s_mpt >= res['min_mpt_mva']
-    check_card(bc[3], "—", "MPT Adequate",
-        ok=mpt_ok,
-        actual=f"{n_mpt*s_mpt:.0f} MVA specified",
-        required=f"{res['min_mpt_mva']:.1f} MVA min",
-        note=f"Margin: {n_mpt*s_mpt - res['min_mpt_mva']:+.1f} MVA")
-
-    st.divider()
-
-    # ── Single Line Diagram ──────────────────────────────────────────────────
-    st.subheader("📐 Power Flow Cascade")
-
-    cas = res['cascade']
-    labels = [k.replace('\n',' ') for k in cas]
-    fig_sld = go.Figure()
-    fig_sld.update_layout(
-        height=300, plot_bgcolor='white', paper_bgcolor='white',
-        margin=dict(l=5,r=5,t=30,b=5),
-        xaxis=dict(visible=False,range=[-0.6,4.6]),
-        yaxis=dict(visible=False,range=[-0.15,1.55]),
-        showlegend=False, title="Inverter → MVT → MV Bus → POI"
-    )
-    for i,(stage,v) in enumerate(cas.items()):
-        x=i; pf_col='#16a34a' if v['PF']>=target_pf else '#dc2626'
-        fig_sld.add_shape(type='rect',x0=x-.38,x1=x+.38,y0=.52,y1=.62,
-                          fillcolor='#1e40af',line_color='#1e40af')
-        lbl=stage.replace('\n',' ')
-        fig_sld.add_annotation(x=x,y=1.48,text=f"<b>{lbl}</b>",showarrow=False,font=dict(size=11,color='#1e293b'))
-        fig_sld.add_annotation(x=x,y=1.28,text=f"P = {v['P']:.1f} MW",showarrow=False,font=dict(size=10,color='#1e40af'))
-        fig_sld.add_annotation(x=x,y=1.10,text=f"Q = {v['Q']:.1f} MVAR",showarrow=False,font=dict(size=10,color='#6d28d9'))
-        fig_sld.add_annotation(x=x,y=0.92,text=f"S = {v['S']:.1f} MVA",showarrow=False,font=dict(size=10,color='#0f766e'))
-        fig_sld.add_annotation(x=x,y=0.32,text=f"PF = {v['PF']:.3f}",showarrow=False,font=dict(size=10,color=pf_col))
-        if i<3:
-            fig_sld.add_annotation(x=x+.55,y=.57,text="→",showarrow=False,font=dict(size=20,color='#94a3b8'))
-    # Aux annotation
-    fig_sld.add_annotation(x=2,y=0.12,text=f"↑ Aux {res['aux_mw']:.2f} MW subtracted",
-                           showarrow=False,font=dict(size=9,color='#b45309'))
-    # POI target
-    fig_sld.add_annotation(x=3.5,y=0.12,
-        text=f"Target: {poi_mw:.0f} MW / {res['q_poi_need']:.1f} MVAR / PF {target_pf:.2f}",
-        showarrow=False,font=dict(size=9,color='#374151'))
-    st.plotly_chart(fig_sld,use_container_width=True)
-
-    # Cascade table
-    cdf = pd.DataFrame([
-        {'Stage':k.replace('\n',' '),'P (MW)':round(v['P'],2),
-         'Q (MVAR)':round(v['Q'],2),'S (MVA)':round(v['S'],2),'PF':round(v['PF'],4)}
-        for k,v in cas.items()
-    ])
-    cdf.loc[len(cdf)] = {'Stage':'▶ POI Target','P (MW)':poi_mw,
-        'Q (MVAR)':round(res['q_poi_need'],2),'S (MVA)':round(poi_mw/target_pf,2),'PF':target_pf}
-    st.dataframe(cdf.set_index('Stage'),use_container_width=True)
+    bc=st.columns(4)
+    check_card(bc[0],"2","Active Power",res['check2_power'],
+               f"{res['p_poi']:.2f} MW",f"{poi_mw:.1f} MW",
+               f"PCS PF = {res['pf_operating']:.3f} (derived)")
+    check_card(bc[1],"1","Energy / Overbuild",res['check1_energy'],
+               f"{res['e_poi_bol']:.1f} MWh BOL",f"{poi_mwh:.0f} MWh",
+               f"Overbuild: {res['overbuild_actual']:+.1f}%")
+    check_card(bc[2],"3","Reactive FERC 827",res['check3_reactive'],
+               f"{res['q_avail_mvbus']:.2f} MVAR @ MV bus",
+               f"{res['q_needed_mvbus']:.2f} MVAR @ MV bus",
+               f"POI target: {res['q_poi_target']:.2f} MVAR")
+    mpt_ok=n_mpt*s_mpt>=res['min_mpt_mva']
+    check_card(bc[3],"—","MPT Adequate",mpt_ok,
+               f"{n_mpt*s_mpt:.0f} MVA specified",
+               f"{res['min_mpt_mva']:.1f} MVA min",
+               f"Margin: {n_mpt*s_mpt-res['min_mpt_mva']:+.1f} MVA")
 
     st.divider()
 
     # ── Tabs ─────────────────────────────────────────────────────────────────
-    t1,t2,t3,t4 = st.tabs(["📈 PV Curve","📉 Degradation","📋 Equipment","🔢 Sizing Logic"])
+    t1,t2,t3,t4 = st.tabs(["📈 PV Curve","📉 Degradation","📋 Equipment","🔢 All Configs"])
 
     with t1:
         with st.spinner("Running power flow sweep…"):
-            isu_s = res['n_pcs'] * mvt_mva
+            isu_s = res['n_pcs_base'] * mvt_mva
             df_pf = run_pf_sweep(
                 float(poi_lim), float(n_mpt*s_mpt), z_mpt, xr_mpt, 10.*n_mpt,
-                isu_s, z_isu, xr_isu, 8.*res['n_pcs'],
-                res['n_pcs']*inv_mva*pcs_pf/poi_lim,
-                tap_c, float(cap_bank), float(v_calc)
-            )
+                isu_s, z_isu, xr_isu, 8.*res['n_pcs_base'],
+                res['n_pcs_base']*inv_mva*res['pf_operating']/poi_lim,
+                tap_c, float(cap_bank), float(v_calc))
+
         if len(df_pf):
             dl=df_pf[df_pf['Q_inv_MVAR']>=0].sort_values('P_inv_MW')
             dg=df_pf[df_pf['Q_inv_MVAR']< 0].sort_values('P_inv_MW')
             fig=go.Figure()
-            fig.add_hrect(y0=v_min_pf,y1=v_max_pf,fillcolor='lightgreen',opacity=.10,line_width=0)
-            fig.add_hline(y=v_min_pf,line_dash='dash',line_color='red',line_width=1.5)
-            fig.add_hline(y=v_max_pf,line_dash='dash',line_color='red',line_width=1.5)
-            fig.add_vline(x=poi_mw,line_dash='dot',line_color='gray',annotation_text=f"{poi_mw:.0f} MW")
-            if len(dl): fig.add_trace(go.Scatter(x=dl['P_inv_MW'],y=dl['V_POI'],mode='lines',name='Leading Q',line=dict(color='royalblue',width=2.5)))
-            if len(dg): fig.add_trace(go.Scatter(x=dg['P_inv_MW'],y=dg['V_POI'],mode='lines',name='Lagging Q', line=dict(color='darkorange',width=2.5)))
+            fig.add_hrect(y0=v_min,y1=v_max,fillcolor='lightgreen',opacity=.10,line_width=0)
+            fig.add_hline(y=v_min,line_dash='dash',line_color='red',line_width=1.5,
+                          annotation_text=f"V_min={v_min}")
+            fig.add_hline(y=v_max,line_dash='dash',line_color='red',line_width=1.5,
+                          annotation_text=f"V_max={v_max}", annotation_position="top left")
+            fig.add_vline(x=poi_mw,line_dash='dot',line_color='gray',
+                          annotation_text=f"{poi_mw:.0f} MW")
+            if len(dl): fig.add_trace(go.Scatter(x=dl['P_inv_MW'],y=dl['V_POI'],mode='lines',
+                name='Leading Q',line=dict(color='royalblue',width=2.5)))
+            if len(dg): fig.add_trace(go.Scatter(x=dg['P_inv_MW'],y=dg['V_POI'],mode='lines',
+                name='Lagging Q',line=dict(color='darkorange',width=2.5)))
             y_lo=max(.80,df_pf['V_POI'].min()-.03); y_hi=min(1.25,df_pf['V_POI'].max()+.03)
-            fig.update_layout(title="PV Curve — POI Voltage vs Active Power",
+            fig.update_layout(title=f"PV Curve — {res['n_pcs_base']} PCS × {sel_ratio} BESS",
                 xaxis_title="P_inv (MW)",yaxis_title="V_POI (pu)",
                 yaxis=dict(range=[y_lo,y_hi]),height=420,legend=dict(x=.01,y=.99))
             st.plotly_chart(fig,use_container_width=True)
             v_nom=df_pf.loc[(df_pf['P_inv_MW']-poi_mw).abs().idxmin(),'V_POI']
-            p1,p2,p3=st.columns(3)
-            p1.metric("V@rated P",f"{v_nom:.4f} pu")
-            p2.metric("% in V-band",f"{((df_pf['V_POI']>=v_min_pf)&(df_pf['V_POI']<=v_max_pf)).mean()*100:.1f}%")
+            p1,p2,p3,p4=st.columns(4)
+            p1.metric("V_POI @ rated P",f"{v_nom:.4f} pu",
+                      delta="✓ In limits" if v_min<=v_nom<=v_max else "⚠ Violation")
+            p2.metric("% pts in V-band",f"{((df_pf['V_POI']>=v_min)&(df_pf['V_POI']<=v_max)).mean()*100:.1f}%")
             p3.metric("Converged",f"{len(df_pf)}/121")
+            p4.metric("PCS op. PF",f"{res['pf_operating']:.3f}")
         else:
-            st.warning("Power flow did not converge. Check tap position.")
+            st.warning("Power flow did not converge — check tap position and MPT size.")
 
     with t2:
+        ddf = res['deg_df']
+        y_lo_deg = max(0, ddf['Total E@POI (MWh)'].min() * 0.85)
+        y_hi_deg = ddf['Total E@POI (MWh)'].max() * 1.08
+
         fig2 = go.Figure()
-        fig2.add_hline(y=poi_mwh, line_dash='dash', line_color='red', line_width=1.5,
-                       annotation_text=f"Target {poi_mwh:.0f} MWh", annotation_position="top left")
-        fig2.add_hrect(y0=0, y1=poi_mwh, fillcolor='#fee2e2', opacity=0.06, line_width=0)
+        # Shaded "below target" band
+        fig2.add_hrect(y0=y_lo_deg, y1=poi_mwh,
+                       fillcolor='#fee2e2', opacity=0.15, line_width=0)
+        fig2.add_hline(y=poi_mwh, line_dash='dash', line_color='red', line_width=2,
+                       annotation_text=f"Target {poi_mwh:.0f} MWh",
+                       annotation_position="top left",
+                       annotation_font=dict(color='red', size=11))
 
-        # Total energy (solid)
+        # Total energy line
         fig2.add_trace(go.Scatter(
-            x=res['deg_df']['Year'], y=res['deg_df']['Total E@POI (MWh)'],
+            x=ddf['Year'], y=ddf['Total E@POI (MWh)'],
             mode='lines+markers', name='Total E @ POI',
-            line=dict(color='royalblue', width=2.5), marker=dict(size=6)))
+            line=dict(color='royalblue', width=3),
+            marker=dict(size=7, color='royalblue'),
+            fill='tozeroy', fillcolor='rgba(30,64,175,0.06)'))
 
-        # Base group only (dotted) when there are secondary groups
-        if len(res['groups_act']) > 1:
-            fig2.add_trace(go.Scatter(
-                x=res['deg_df']['Year'], y=res['deg_df']['Base E@POI (MWh)'],
-                mode='lines', name=f"G1 only ({res['groups_act'][0][0]}×{res['groups_act'][0][1]} BESS)",
-                line=dict(color='lightblue', width=1.5, dash='dot')))
-
-        # Augmentation bar
-        aug_rows = res['deg_df'][res['deg_df']['Aug E added (MWh)'] > 0]
+        # Augmentation bar — on secondary axis so scale doesn't compress main line
+        aug_rows = ddf[ddf['Aug E added (MWh)'] > 0]
         if len(aug_rows):
             fig2.add_trace(go.Bar(
                 x=aug_rows['Year'], y=aug_rows['Aug E added (MWh)'],
-                name='Aug energy added', marker_color='#16a34a', opacity=0.8,
-                text=[f"+{v:.0f} MWh" for v in aug_rows['Aug E added (MWh)']],
-                textposition='outside'))
+                name=f'Augmentation (+{aug_rows["Aug E added (MWh)"].sum():.0f} MWh)',
+                marker_color='#16a34a', opacity=0.9,
+                text=[f"+{v:.0f}" for v in aug_rows['Aug E added (MWh)']],
+                textposition='outside', yaxis='y2'))
 
-        cfg_str = ' + '.join(f'{n}×{u}batt' for n,u in res['groups_act'])
         fig2.update_layout(
-            title=f"Energy @ POI — {cfg_str}",
-            xaxis_title="Year", yaxis_title="MWh @ POI",
-            yaxis=dict(rangemode='tozero'), barmode='overlay',
-            height=400, legend=dict(x=0.01, y=0.99))
+            title=f"Energy @ POI — {res['n_pcs_base']} PCS × {sel_ratio} BESS  |  "
+                  f"BOL {res['e_poi_bol']:.0f} MWh  |  Overbuild {res['overbuild_actual']:+.1f}%",
+            xaxis_title="Year",
+            yaxis=dict(title="MWh @ POI", range=[y_lo_deg, y_hi_deg]),
+            yaxis2=dict(title="Aug MWh added", overlaying='y', side='right',
+                        range=[0, aug_rows['Aug E added (MWh)'].max()*6 if len(aug_rows) else 100],
+                        showgrid=False),
+            height=420, legend=dict(x=0.01, y=0.99),
+            barmode='overlay')
         st.plotly_chart(fig2, use_container_width=True)
 
-        m1,m2,m3,m4 = st.columns(4)
+        m1,m2,m3,m4,m5 = st.columns(5)
         m1.metric("E @ BOL", f"{res['e_poi_bol']:.1f} MWh")
-        m2.metric("Overbuild", f"{res['overbuild_pct']:+.1f}%")
-        m3.metric("Yrs ≥ target", str(res['overbuild_years']))
-        yr_drop = next((r['Year'] for r in res['deg_df'].to_dict('records')
-                        if r['Total E@POI (MWh)'] < poi_mwh), "Never")
-        m4.metric("First yr < target", str(yr_drop))
+        m2.metric("Overbuild", f"{res['overbuild_actual']:+.1f}%")
+        m3.metric("Target E", f"{poi_mwh:.0f} MWh")
+        yr_drop = res['yr_below']
+        m4.metric("First yr < target", str(yr_drop) if yr_drop is not None else "Never ✅")
+        m5.metric("Aug adds", f"{res['n_pcs_aug']} PCS / {res['n_batt_aug']} BESS")
 
-        st.dataframe(res['deg_df'].set_index('Year'), use_container_width=True)
-        st.download_button("⬇ Degradation CSV", res['deg_df'].to_csv(index=False), "degradation.csv","text/csv")
+        st.dataframe(ddf.set_index('Year'), use_container_width=True)
+        st.download_button("⬇ CSV", ddf.to_csv(index=False), "degradation.csv","text/csv")
 
     with t3:
-        glabels = ["Base","Aug/Partial","Extra"]
-        rows = []
-        for gi, (gn, gu) in enumerate(res['groups_act']):
-            lbl = glabels[gi] if gi < len(glabels) else f"Group {gi+1}"
-            install = "Day 1" if gi==0 else (f"Year {int(aug_year)}" if int(aug_year)>0 else "Day 1")
-            rows.append({
-                "Group": f"G{gi+1} — {lbl} ({install})",
-                "PCS qty": gn,
-                "BESS/PCS": gu,
-                "Total BESS": gn*gu,
-                "DC MWh": round(gn*gu*batt_mwh, 1),
-                "E@POI MWh": round(gn*gu*batt_mwh*res['eta_all'], 1),
-            })
-        rows += [
-            {"Group":"MVT","PCS qty":res['n_pcs'],"BESS/PCS":"—","Total BESS":"—",
-             "DC MWh":"—","E@POI MWh":f"{res['n_pcs']*mvt_mva:.0f} MVA total"},
-            {"Group":"MPT","PCS qty":n_mpt,"BESS/PCS":"—","Total BESS":"—",
-             "DC MWh":"—","E@POI MWh":f"{n_mpt*s_mpt:.0f} MVA (min {res['min_mpt_mva']:.1f})"},
+        eq_rows = [
+            {"Equipment": f"PCS ({pcs_model})", "Qty (base)": res['n_pcs_base'],
+             "Qty (aug)": res['n_pcs_aug'], "Unit": f"{inv_mva} MVA"},
+            {"Equipment": f"Battery ({batt_model})", "Qty (base)": res['n_batt_base'],
+             "Qty (aug)": res['n_batt_aug'], "Unit": f"{batt_mwh} MWh DC"},
+            {"Equipment": "MVT", "Qty (base)": res['n_pcs_base'],
+             "Qty (aug)": res['n_pcs_aug'], "Unit": f"{mvt_mva} MVA"},
+            {"Equipment": "MPT", "Qty (base)": n_mpt,
+             "Qty (aug)": 0, "Unit": f"{s_mpt:.0f} MVA (min {res['min_mpt_mva']:.1f})"},
         ]
-        df_eq = pd.DataFrame(rows)
-        st.dataframe(df_eq.set_index("Group"), use_container_width=True)
-        st.download_button("⬇ Equipment CSV", df_eq.to_csv(index=False), "equipment.csv","text/csv")
+        eq_df = pd.DataFrame(eq_rows).set_index("Equipment")
+        eq_df['Total (after aug)'] = eq_df['Qty (base)'] + eq_df['Qty (aug)']
+        st.dataframe(eq_df, use_container_width=True)
+        st.download_button("⬇ Equipment CSV", eq_df.to_csv(), "equipment.csv","text/csv")
+
+        # Power cascade
+        st.markdown("**Power Cascade**")
+        cdf = pd.DataFrame([
+            {'Stage':'Inverter Output','P (MW)':round(res['p_poi']/eta_mpt/eta_tx/eta_mv/eta_mvt*eta_pcs/(eta_pcs),1),
+             'Note':f"PCS PF = {res['pf_operating']:.3f} (derived from P/Q requirement)"},
+            {'Stage':'MV Bus (−Aux)',  'P (MW)':round(res['p_mpt_in'],2), 'Note':f"Aux = {res['aux_mw']:.2f} MW"},
+            {'Stage':'POI',            'P (MW)':round(res['p_poi'],2),    'Note':f"PF = {res['pf_poi']:.3f}"},
+            {'Stage':'▶ POI Target',   'P (MW)':poi_mw,                   'Note':f"PF = {target_pf:.2f}"},
+        ])
+        st.dataframe(cdf.set_index('Stage'), use_container_width=True)
 
     with t4:
-        driver = "POWER" if res['n_power']>=res['n_energy'] else "ENERGY"
-        soh_lbl = f"SOH[{int(aug_year)}]={res['soh_aug']:.4f}" if int(aug_year)>0 else f"SOH[{int(proj_yrs)}]={res['soh_aug']:.4f}"
-        st.markdown("#### Auto-Sizing Suggestion")
-        st.info(
-            f"Driver: **{driver}** | "
-            f"n_power={res['n_power']}, n_energy={res['n_energy']} ({soh_lbl}) → "
-            f"**n_base_auto={res['n_base_auto']}** + n_aug_auto={res['n_aug_auto']}\n\n"
-            f"Your config: {' + '.join(f'{n}×{u}batt' for n,u in res['groups_act'])} "
-            f"= **{res['n_pcs']} PCS, {res['n_batt_bol']} batteries**"
-        )
-        st.markdown("#### User Groups vs Auto")
-        gdf_rows = []
-        for gi,(gn,gu) in enumerate(res['groups_act']):
-            gdf_rows.append({'Group':f'G{gi+1}','PCS':gn,'BESS/PCS':gu,
-                'DC MWh':round(gn*gu*batt_mwh,1),'E@POI MWh':round(gn*gu*batt_mwh*res['eta_all'],1)})
-        gdf_rows.append({'Group':'TOTAL','PCS':res['n_pcs'],'BESS/PCS':'—',
-            'DC MWh':round(res['e_dc_bol'],1),'E@POI MWh':round(res['e_poi_bol'],1)})
-        st.dataframe(pd.DataFrame(gdf_rows).set_index('Group'),use_container_width=True)
+        # Multi-config degradation overlay
+        st.markdown("#### Degradation overlay — all configs")
+        fig4 = go.Figure()
+        fig4.add_hline(y=poi_mwh, line_dash='dash', line_color='red', line_width=1.5,
+                       annotation_text=f"Target {poi_mwh:.0f} MWh")
+        colors = ['royalblue','darkorange','green','purple','crimson','teal']
+        all_mins = []
+        for i,ratio in enumerate(bess_ratios):
+            r = results[ratio]
+            ddf2 = r['deg_df']
+            all_mins.append(ddf2['Total E@POI (MWh)'].min())
+            fig4.add_trace(go.Scatter(
+                x=ddf2['Year'], y=ddf2['Total E@POI (MWh)'],
+                mode='lines+markers', name=f"{ratio} BESS/PCS ({r['n_pcs_base']} PCS)",
+                line=dict(color=colors[i%len(colors)], width=2),
+                marker=dict(size=4)))
+        fig4.update_layout(
+            title="Energy @ POI — all BESS/PCS ratios",
+            xaxis_title="Year", yaxis_title="MWh @ POI",
+            yaxis=dict(range=[max(0,min(all_mins)*0.9), max(r['e_poi_bol'] for r in results.values())*1.05]),
+            height=400, legend=dict(x=0.01,y=0.99))
+        st.plotly_chart(fig4, use_container_width=True)
 
-        loss_df=pd.DataFrame([
-            {"Stage":"Transmission","η":eta_tx},{"Stage":"MPT","η":eta_mpt},
-            {"Stage":"MV Cable","η":eta_mv},{"Stage":"MVT","η":eta_mvt},
-            {"Stage":"PCS","η":eta_pcs},{"Stage":"DC Cable","η":eta_dc},
-            {"Stage":"Charge/Disch","η":eta_chg},{"Stage":"Auxiliary","η":eta_aux},
-            {"Stage":"→ TOTAL","η":round(res['eta_all'],5)},
-        ])
-        st.dataframe(loss_df.set_index("Stage"),use_container_width=True)
+        # Full table
+        st.markdown("#### Full sizing table")
+        st.dataframe(cmp_df, use_container_width=True)
+        st.download_button("⬇ Full comparison CSV", cmp_df.to_csv(), "sizing_comparison.csv","text/csv")
 
 else:
-    st.info("👈 Set parameters in the sidebar and press **▶ Run Sizing**")
-    with st.expander("ℹ️ Augmentation logic"):
-        st.markdown("""
-**With augmentation (aug_year > 0):**
+    st.info("👈 Set parameters in the sidebar, then press **▶ Size All Configurations**")
+    with st.expander("ℹ️ How this tool works"):
+        st.markdown(f"""
+**Auto-sizing flow:**
 
-1. **n_power** = ceil(P_inv_needed / (inv_MVA × PCS_PF))  — from power delivery requirement
-2. **n_energy** = ceil(POI_MWh / (block_MWh × SOH[aug_year]))  — base must last *until* aug_year
-3. **n_base** = max(n_power, n_energy)
-4. **n_aug** = ceil(gap_at_aug_year / (aug_units × batt_MWh × η))
-5. All n_base+n_aug **PCS installed at BOL** (for power/reactive compliance)
-6. Aug blocks carry `aug_units_bol` batteries at BOL, filled to full at aug_year
+1. **For each BESS/PCS ratio** (e.g. 2, 3, 4, 5, 6 batteries per PCS):
+   - Find minimum PCS qty where both **P and Q are met simultaneously**
+   - PCS operating PF is **derived** (not a user input) — minimum PF needed to deliver MW target, maximising Q headroom
+   - Energy PCS qty = ceil(poi_mwh × (1+overbuild%) / (batt/pcs × batt_mwh × η_total))
+   - n_pcs_base = max(power_qty, energy_qty)
 
-**Example: 200MW / 800MWh, aug_year=5, PCS_PF=0.90, 5.3 MVA, 6.138 MWh/unit, 4 units/block:**
-- n_power = 44, n_energy = ceil(800/22.34/0.8633) = 42 → n_base = 44
-- E@aug_yr5 = 44×22.34×0.8633 = 849 MWh > 800 → n_aug = 0
-- Result: 44 PCS × 4 batteries = 176 units
+2. **Overbuild %** controls initial installed energy:
+   `E_BOL = poi_mwh × (1 + overbuild%/100)`
+   This ensures energy degrades to ≥ poi_mwh at the augmentation year
 
-**For 39+5 split:** use aug_year=5 with 2 batteries in aug blocks, fewer base blocks
+3. **3 Checks** (matching Excel R29–R31):
+   - ✅ Energy: E_BOL ≥ poi_mwh
+   - ✅ Power: P@POI ≥ poi_mw  
+   - ✅ Reactive (FERC 827): Q@MV_bus ≥ Q_needed
+
+4. **Power flow** validates V_POI across full P-Q operating range
         """)
