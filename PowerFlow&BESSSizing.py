@@ -391,17 +391,40 @@ st.caption(f"**{proj_name}** · {iso} · {poi_mw:.0f} MW / {poi_mwh:.0f} MWh @ P
 st.divider()
 
 # ── RUN ───────────────────────────────────────────────────────────────────────
+# Persist results in session_state so fine-tune widget interactions don't lose them
 if run_btn:
-    eta_all_ref = compute_eta(eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux)
-
     with st.spinner(f"Sizing {len(bess_ratios)} configurations…"):
-        results = {}
+        _results = {}
         for ratio in bess_ratios:
-            results[ratio] = size_config(
+            _results[ratio] = size_config(
                 poi_mw, poi_mwh, target_pf,
                 inv_mva, ratio, batt_mwh, aux_kw,
                 eta_pcs,eta_mvt,eta_mv,eta_mpt,eta_tx,eta_dc,eta_chg,eta_aux,
                 int(aug_year), float(overbuild_pct), int(proj_yrs), soh_curve, float(cap_bank))
+    st.session_state['bess_results']   = _results
+    st.session_state['bess_ratios']    = bess_ratios
+    st.session_state['bess_params']    = dict(
+        poi_mw=poi_mw, poi_mwh=poi_mwh, target_pf=target_pf,
+        aug_year=aug_year, overbuild_pct=overbuild_pct, proj_yrs=proj_yrs,
+        n_mpt=n_mpt, s_mpt=s_mpt, inv_mva=inv_mva, mvt_mva=mvt_mva,
+        batt_mwh=batt_mwh, aux_kw=aux_kw, eta_mvt=eta_mvt, eta_mv=eta_mv,
+        eta_mpt=eta_mpt, eta_tx=eta_tx, eta_pcs=eta_pcs, cap_bank=cap_bank,
+        soh_curve=soh_curve, v_min=v_min, v_max=v_max, v_calc=v_calc,
+        tap_c=tap_c, z_isu=z_isu, xr_isu=xr_isu)
+
+# ── DISPLAY RESULTS (persisted in session_state across widget interactions) ──
+if 'bess_results' in st.session_state:
+    results     = st.session_state['bess_results']
+    bess_ratios = st.session_state['bess_ratios']
+    p           = st.session_state['bess_params']
+    # Use the params from when Run was pressed (not current sidebar state)
+    poi_mw=p['poi_mw']; poi_mwh=p['poi_mwh']; target_pf=p['target_pf']
+    aug_year=p['aug_year']; overbuild_pct=p['overbuild_pct']; proj_yrs=p['proj_yrs']
+    n_mpt=p['n_mpt']; s_mpt=p['s_mpt']; inv_mva=p['inv_mva']; mvt_mva=p['mvt_mva']
+    batt_mwh=p['batt_mwh']; aux_kw=p['aux_kw']; eta_mvt=p['eta_mvt']; eta_mv=p['eta_mv']
+    eta_mpt=p['eta_mpt']; eta_tx=p['eta_tx']; eta_pcs=p['eta_pcs']; cap_bank=p['cap_bank']
+    soh_curve=p['soh_curve']; v_min=p['v_min']; v_max=p['v_max']; v_calc=p['v_calc']
+    tap_c=p['tap_c']; z_isu=p['z_isu']; xr_isu=p['xr_isu']
 
     # ── COMPARISON TABLE ──────────────────────────────────────────────────────
     st.subheader("📊 Configuration Comparison")
@@ -769,7 +792,7 @@ if run_btn:
             st.caption(f"First year below target: **{yr_drop_ft if yr_drop_ft is not None else 'Never ✅'}**  |  "
                        f"BOL: {ft_e_poi:.1f} MWh  |  Overbuild: {ft_overbuild:+.1f}%")
 
-else:
+else:  # no session state yet
     st.info("👈 Set parameters in the sidebar, then press **▶ Size All Configurations**")
     with st.expander("ℹ️ How this tool works"):
         st.markdown(f"""
