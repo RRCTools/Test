@@ -197,17 +197,30 @@ def size_config(poi_mw, poi_mwh, target_pf,
     q_inv_act    = n_pcs_total * inv_mva * np.sqrt(max(1-pf_operating**2,0))
     s_inv_act    = n_pcs_total * inv_mva
     p_mvt_out    = p_inv_act * eta_mvt; q_mvt_out = q_inv_act * eta_mvt
-    p_mv_bus     = p_mvt_out * eta_mv;  q_mv_bus  = q_mvt_out * eta_mv
-    p_mpt_in     = p_mv_bus - aux_mw;   q_mpt_in  = q_mv_bus + cap_mvar
-    p_poi        = p_mpt_in * eta_mpt * eta_tx
-    q_poi        = q_mpt_in * eta_mpt * eta_tx
-    s_poi        = np.sqrt(p_poi**2+q_poi**2)
-    pf_poi       = p_poi/s_poi if s_poi>0 else 1.
-    min_mpt_mva  = np.sqrt(p_mpt_in**2+q_mpt_in**2)
+    p_mv_bus      = p_mvt_out * eta_mv;  q_mv_bus  = q_mvt_out * eta_mv
+    p_mpt_in      = p_mv_bus - aux_mw;   q_mpt_in  = q_mv_bus + cap_mvar
+    s_mpt_lv      = np.sqrt(p_mpt_in**2 + q_mpt_in**2)
+    p_poi         = p_mpt_in * eta_mpt * eta_tx
+    q_poi         = q_mpt_in * eta_mpt * eta_tx   # approximate (eta_mpt is real-power loss only)
+    s_poi         = np.sqrt(p_poi**2 + q_poi**2)
+    pf_poi        = p_poi/s_poi if s_poi > 0 else 1.
+    min_mpt_mva   = s_mpt_lv
 
-    # Q checks
-    q_avail_mvbus = n_pcs_total*inv_mva*np.sqrt(max(1-pf_operating**2,0))*eta_mvt*eta_mv + cap_mvar
-    q_needed_mvbus= q_poi_target*(q_mpt_in/q_poi) if q_poi>0.01 else q_poi_target/(eta_mpt*eta_tx)
+    # ── Q CHECKS — both at POI (primary) and MV bus (secondary) ──────────────
+    # Q available from inverters at MV bus (before MPT)
+    q_avail_mvbus  = (n_pcs_total * inv_mva * np.sqrt(max(1-pf_operating**2, 0))
+                      * eta_mvt * eta_mv + cap_mvar)
+    # Q needed at MV bus: q_poi_target back-calculated through MPT+TX losses
+    # eta_mpt/eta_tx only capture ~0.5% real loss; Q drop through MPT impedance
+    # is larger (typically 5-10% at full load for Z=8-10%).
+    # Most honest: check Q @ POI directly — what arrives at the interconnection.
+    q_needed_mvbus = q_poi_target / (eta_mpt * eta_tx)  # first-order back-calc
+
+    # Primary FERC 827 check: Q actually delivered AT POI >= requirement
+    q_check_poi   = q_poi >= q_poi_target * 0.999
+    # Secondary: MV bus headroom (ensures inverters have enough Q capacity)
+    q_check_mvbus = q_avail_mvbus >= q_needed_mvbus * 0.999
+    q_check_pass  = q_check_poi and q_check_mvbus
 
     # ── Degradation table ─────────────────────────────────────────────────────
     e_base_bol = e_poi_bol
@@ -250,10 +263,15 @@ def size_config(poi_mw, poi_mwh, target_pf,
         'blk_mwh_poi':blk_mwh_poi,
         'soh_at_aug':soh_at_aug,
         # Checks
-        'check1_energy': e_poi_bol >= poi_mwh*0.999,
-        'check2_power':  p_poi >= poi_mw*0.999,
-        'check3_reactive': q_avail_mvbus >= q_needed_mvbus*0.999,
-        'q_poi_target':q_poi_target,'q_avail_mvbus':q_avail_mvbus,'q_needed_mvbus':q_needed_mvbus,
+        'check1_energy':   e_poi_bol >= poi_mwh*0.999,
+        'check2_power':    p_poi >= poi_mw*0.999,
+        'check3_reactive': q_check_pass,
+        'q_check_poi':     q_check_poi,
+        'q_check_mvbus':   q_check_mvbus,
+        'q_poi':           q_poi,
+        'q_poi_target':    q_poi_target,
+        'q_avail_mvbus':   q_avail_mvbus,
+        'q_needed_mvbus':  q_needed_mvbus,
         'yr_below':yr_below,
         'deg_df':deg_df,
     }
@@ -410,6 +428,7 @@ if run_btn:
             'Yr < target': r['yr_below'] if r['yr_below'] else '—',
             'Min MPT (MVA)': round(r['min_mpt_mva'],1),
             'MPT OK': '✅' if mpt_ok else '❌',
+            'Q@POI': f"{'✓' if r['q_check_poi'] else '✗'} {r['q_poi']:.1f}MVAR",
             'P✅ Q✅ E✅': '✅ ALL PASS' if all_ok else f"{c2ok}P {c1ok}E {c3ok}Q",
             'Driver': r['driver'],
         })
@@ -460,10 +479,12 @@ if run_btn:
     check_card(bc[1],"1","Energy / Overbuild",res['check1_energy'],
                f"{res['e_poi_bol']:.1f} MWh BOL",f"{poi_mwh:.0f} MWh",
                f"Overbuild: {res['overbuild_actual']:+.1f}%")
+    c3_note = (f"MV bus: {res['q_avail_mvbus']:.1f} avail / {res['q_needed_mvbus']:.1f} needed "
+               f"{'✓' if res['q_check_mvbus'] else '✗'}")
     check_card(bc[2],"3","Reactive FERC 827",res['check3_reactive'],
-               f"{res['q_avail_mvbus']:.2f} MVAR @ MV bus",
-               f"{res['q_needed_mvbus']:.2f} MVAR @ MV bus",
-               f"POI target: {res['q_poi_target']:.2f} MVAR")
+               f"Q @ POI: {res['q_poi']:.2f} MVAR  {'✓' if res['q_check_poi'] else '✗'}",
+               f"Q @ POI target: {res['q_poi_target']:.2f} MVAR",
+               c3_note)
     mpt_ok=n_mpt*s_mpt>=res['min_mpt_mva']
     check_card(bc[3],"—","MPT Adequate",mpt_ok,
                f"{n_mpt*s_mpt:.0f} MVA specified",
@@ -624,6 +645,129 @@ if run_btn:
         st.markdown("#### Full sizing table")
         st.dataframe(cmp_df, use_container_width=True)
         st.download_button("⬇ Full comparison CSV", cmp_df.to_csv(), "sizing_comparison.csv","text/csv")
+
+    # ── FINE-TUNING: MIXED CONFIG ────────────────────────────────────────────
+    st.divider()
+    st.subheader("🎛 Fine-Tune: Mixed BESS/PCS Configuration")
+    st.caption("Start from auto-sized result, then adjust individual PCS groups to explore trade-offs.")
+
+    with st.expander("Open fine-tuning tool", expanded=False):
+        ft_base_ratio = st.selectbox("Start from ratio", bess_ratios,
+            index=bess_ratios.index(best_ratio) if passing else 0,
+            key="ft_base")
+        ft_ref = results[ft_base_ratio]
+
+        st.markdown(f"**Auto result:** {ft_ref['n_pcs_base']} PCS × {ft_base_ratio} BESS  "
+                    f"= {ft_ref['n_batt_base']} batteries | E@BOL = {ft_ref['e_poi_bol']:.1f} MWh")
+
+        st.markdown("**Define your mixed config:**")
+        n_ft_groups = st.number_input("Number of groups", value=2, min_value=1, max_value=4, key="ft_ng")
+        ft_groups = []
+        ft_colors = ["#1f6feb","#238636","#9e6a03","#7c3aed"]
+        ft_labels = ["Main","Partial/Aug","Extra 1","Extra 2"]
+        for g in range(int(n_ft_groups)):
+            st.markdown(
+                f'<div style="border-left:3px solid {ft_colors[g]};padding:2px 8px;'
+                f'margin:3px 0;font-size:.78rem"><b>Group {g+1} — {ft_labels[g]}</b></div>',
+                unsafe_allow_html=True)
+            default_n = ft_ref['n_pcs_base'] if g==0 else 0
+            default_u = ft_base_ratio if g==0 else max(ft_base_ratio-2, 1)
+            fc1,fc2 = st.columns(2)
+            gn = fc1.number_input(f"# PCS (G{g+1})", value=default_n, min_value=0, key=f"ft_n{g}")
+            gu = fc2.number_input(f"BESS/PCS (G{g+1})", value=default_u, min_value=0, max_value=20, key=f"ft_u{g}")
+            ft_groups.append((int(gn), int(gu)))
+
+        ft_groups_act = [(n,u) for n,u in ft_groups if n>0]
+        if ft_groups_act:
+            ft_total_pcs  = sum(n for n,_ in ft_groups_act)
+            ft_total_batt = sum(n*u for n,u in ft_groups_act)
+            ft_e_dc       = ft_total_batt * batt_mwh
+            ft_e_poi      = ft_e_dc * ft_ref['eta_all']
+            ft_overbuild  = (ft_e_poi - poi_mwh) / poi_mwh * 100
+
+            # Power check at ft_total_pcs
+            ft_aux = ft_total_pcs * aux_kw / 1000.
+            ft_p_mpt_lv = poi_mw / (eta_mpt * eta_tx)
+            ft_p_inv_nd = (ft_p_mpt_lv + ft_aux) / eta_mv / eta_mvt
+            ft_pf_op    = min(ft_p_inv_nd / (ft_total_pcs * inv_mva), 1.0) if ft_total_pcs>0 else 1.
+            ft_p_poi    = (ft_p_mpt_lv) * eta_mpt * eta_tx
+            ft_q_avail  = ft_total_pcs * inv_mva * np.sqrt(max(1-ft_pf_op**2,0)) * eta_mvt * eta_mv * eta_mpt * eta_tx if ft_total_pcs>0 else 0.
+            ft_q_target = poi_mw * np.tan(np.arccos(target_pf))
+
+            st.markdown("**Preview:**")
+            pr1,pr2,pr3,pr4,pr5 = st.columns(5)
+            pr1.metric("Total PCS", ft_total_pcs)
+            pr2.metric("Total BESS", ft_total_batt)
+            pr3.metric("E @ POI BOL", f"{ft_e_poi:.1f} MWh")
+            pr4.metric("Overbuild", f"{ft_overbuild:+.1f}%",
+                       delta="✓" if ft_overbuild >= 0 else "Under target")
+            pr5.metric("PCS op. PF", f"{ft_pf_op:.3f}")
+
+            def ft_badge(col, label, ok, val):
+                sym = "✓" if ok else "✗"
+                col.markdown(
+                    f'<div style="background:{"#0d3321" if ok else "#3d1a1a"};'
+                    f'border:1px solid {"#238636" if ok else "#b62324"};'
+                    f'border-radius:5px;padding:6px 10px;font-size:.80rem">'
+                    f'<span style="color:{"#3fb950" if ok else "#f85149"};font-weight:700">{sym} {label}</span>'
+                    f'<br><span style="color:#c9d1d9">{val}</span></div>',
+                    unsafe_allow_html=True)
+
+            fb1,fb2,fb3 = st.columns(3)
+            ft_badge(fb1, "Power", ft_p_poi >= poi_mw*0.999, f"{ft_p_poi:.1f} / {poi_mw:.0f} MW")
+            ft_badge(fb2, "Energy", ft_e_poi >= poi_mwh*0.999, f"{ft_e_poi:.1f} / {poi_mwh:.0f} MWh")
+            ft_badge(fb3, "Q @ POI", ft_q_avail >= ft_q_target*0.999,
+                     f"{ft_q_avail:.1f} avail / {ft_q_target:.1f} needed MVAR")
+
+            # Degradation with mixed groups
+            eta_all_ft = ft_ref['eta_all']
+            soh_local  = soh_curve + [soh_curve[-1]]*(max(int(proj_yrs)+2-len(soh_curve),0))
+            e_groups   = [n*u*batt_mwh*eta_all_ft for n,u in ft_groups_act]
+            ft_deg = []
+            for yr in range(int(proj_yrs)+1):
+                s_yr = soh_local[min(yr,len(soh_local)-1)]
+                e_tot = 0.; aug_ev = 0.
+                for gi, eg in enumerate(e_groups):
+                    if gi == 0:
+                        e_tot += eg * s_yr
+                    else:
+                        if int(aug_year)>0 and yr >= int(aug_year):
+                            s_rel = soh_local[min(yr-int(aug_year),len(soh_local)-1)]
+                            e_tot += eg * s_rel
+                            if yr == int(aug_year): aug_ev += eg
+                ft_deg.append({'Year':yr,'SOH%':round(s_yr*100,1),'Total E@POI':round(e_tot,1),'Aug added':round(aug_ev,1)})
+            ft_deg_df = pd.DataFrame(ft_deg, columns=['Year','SOH%','Total E@POI','Aug added'])
+
+            y_lo_ft = max(0, ft_deg_df['Total E@POI'].min()*0.88)
+            y_hi_ft = ft_deg_df['Total E@POI'].max()*1.06
+            fig_ft = go.Figure()
+            fig_ft.add_hrect(y0=y_lo_ft, y1=poi_mwh, fillcolor='#fee2e2', opacity=0.12, line_width=0)
+            fig_ft.add_hline(y=poi_mwh, line_dash='dash', line_color='red', line_width=2,
+                             annotation_text=f"Target {poi_mwh:.0f} MWh")
+            fig_ft.add_trace(go.Scatter(x=ft_deg_df['Year'], y=ft_deg_df['Total E@POI'],
+                mode='lines+markers', name='Mixed config',
+                line=dict(color='royalblue', width=2.5), marker=dict(size=6)))
+            # Auto-sized reference
+            ref_deg = ft_ref['deg_df']
+            fig_ft.add_trace(go.Scatter(x=ref_deg['Year'], y=ref_deg['Total E@POI (MWh)'],
+                mode='lines', name=f'Auto ({ft_base_ratio} BESS/PCS)',
+                line=dict(color='lightgray', width=1.5, dash='dot')))
+            aug_ft = ft_deg_df[ft_deg_df['Aug added']>0]
+            if len(aug_ft):
+                fig_ft.add_trace(go.Bar(x=aug_ft['Year'], y=aug_ft['Aug added'],
+                    name='Aug added', marker_color='#16a34a', opacity=0.8, yaxis='y2',
+                    text=[f"+{v:.0f}" for v in aug_ft['Aug added']], textposition='outside'))
+            fig_ft.update_layout(
+                title=' + '.join(f'{n}PCS×{u}BESS' for n,u in ft_groups_act),
+                xaxis_title="Year", yaxis=dict(title="MWh @ POI", range=[y_lo_ft, y_hi_ft]),
+                yaxis2=dict(overlaying='y', side='right', showgrid=False,
+                            range=[0, max(aug_ft['Aug added'].max()*6 if len(aug_ft) else 1, 1)]),
+                height=380, legend=dict(x=0.01,y=0.99), barmode='overlay')
+            st.plotly_chart(fig_ft, use_container_width=True)
+
+            yr_drop_ft = next((r['Year'] for r in ft_deg if r['Total E@POI'] < poi_mwh), None)
+            st.caption(f"First year below target: **{yr_drop_ft if yr_drop_ft is not None else 'Never ✅'}**  |  "
+                       f"BOL: {ft_e_poi:.1f} MWh  |  Overbuild: {ft_overbuild:+.1f}%")
 
 else:
     st.info("👈 Set parameters in the sidebar, then press **▶ Size All Configurations**")
