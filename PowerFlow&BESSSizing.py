@@ -687,7 +687,7 @@ if 'bess_results' in st.session_state:
         n_ft_groups = st.number_input("Number of groups", value=2, min_value=1, max_value=4, key="ft_ng")
         ft_groups = []
         ft_colors = ["#1f6feb","#238636","#9e6a03","#7c3aed"]
-        ft_labels = ["Main","Partial/Aug","Extra 1","Extra 2"]
+        ft_labels = ["Main","Secondary","Extra 1","Extra 2"]
         for g in range(int(n_ft_groups)):
             st.markdown(
                 f'<div style="border-left:3px solid {ft_colors[g]};padding:2px 8px;'
@@ -695,15 +695,21 @@ if 'bess_results' in st.session_state:
                 unsafe_allow_html=True)
             default_n = ft_ref['n_pcs_base'] if g==0 else 0
             default_u = ft_base_ratio if g==0 else max(ft_base_ratio-2, 1)
-            fc1,fc2 = st.columns(2)
+            fc1,fc2,fc3 = st.columns([2,2,2])
             gn = fc1.number_input(f"# PCS (G{g+1})", value=default_n, min_value=0, key=f"ft_n{g}")
             gu = fc2.number_input(f"BESS/PCS (G{g+1})", value=default_u, min_value=0, max_value=20, key=f"ft_u{g}")
-            ft_groups.append((int(gn), int(gu)))
+            # Install timing: BOL or augmentation year
+            install_opts = ["BOL (Day 1)", f"Aug (Yr {int(aug_year)})"] if int(aug_year) > 0 else ["BOL (Day 1)"]
+            default_install = 0 if g == 0 else (1 if int(aug_year) > 0 else 0)
+            gi_install = fc3.selectbox(f"Install (G{g+1})", install_opts,
+                                       index=default_install, key=f"ft_inst{g}",
+                                       label_visibility="visible")
+            ft_groups.append((int(gn), int(gu), gi_install))
 
-        ft_groups_act = [(n,u) for n,u in ft_groups if n>0]
+        ft_groups_act = [(n,u,inst) for n,u,inst in ft_groups if n>0]
         if ft_groups_act:
-            ft_total_pcs  = sum(n for n,_ in ft_groups_act)
-            ft_total_batt = sum(n*u for n,u in ft_groups_act)
+            ft_total_pcs  = sum(n for n,u,_ in ft_groups_act)
+            ft_total_batt = sum(n*u for n,u,_ in ft_groups_act)
             ft_e_dc       = ft_total_batt * batt_mwh
             ft_e_poi      = ft_e_dc * ft_ref['eta_all']
             ft_overbuild  = (ft_e_poi - poi_mwh) / poi_mwh * 100
@@ -745,19 +751,28 @@ if 'bess_results' in st.session_state:
             # Degradation with mixed groups
             eta_all_ft = ft_ref['eta_all']
             soh_local  = soh_curve + [soh_curve[-1]]*(max(int(proj_yrs)+2-len(soh_curve),0))
-            e_groups   = [n*u*batt_mwh*eta_all_ft for n,u in ft_groups_act]
+            # Separate BOL groups from aug groups based on per-group install timing
+            ft_e_bol_groups = []  # (energy_bol, install_year)  0=BOL, aug_year=augmentation
+            for gn, gu, gi_inst in ft_groups_act:
+                eg = gn * gu * batt_mwh * eta_all_ft
+                is_aug = (int(aug_year) > 0 and "Aug" in gi_inst)
+                ft_e_bol_groups.append((eg, int(aug_year) if is_aug else 0))
+
             ft_deg = []
             for yr in range(int(proj_yrs)+1):
                 s_yr = soh_local[min(yr,len(soh_local)-1)]
                 e_tot = 0.; aug_ev = 0.
-                for gi, eg in enumerate(e_groups):
-                    if gi == 0:
+                for eg, install_yr in ft_e_bol_groups:
+                    if install_yr == 0:
+                        # BOL group — degrades from year 0
                         e_tot += eg * s_yr
                     else:
-                        if int(aug_year)>0 and yr >= int(aug_year):
-                            s_rel = soh_local[min(yr-int(aug_year),len(soh_local)-1)]
+                        # Aug group — only present from install_yr
+                        if yr >= install_yr:
+                            s_rel = soh_local[min(yr-install_yr, len(soh_local)-1)]
                             e_tot += eg * s_rel
-                            if yr == int(aug_year): aug_ev += eg
+                            if yr == install_yr:
+                                aug_ev += eg
                 ft_deg.append({'Year':yr,'SOH%':round(s_yr*100,1),'Total E@POI':round(e_tot,1),'Aug added':round(aug_ev,1)})
             ft_deg_df = pd.DataFrame(ft_deg, columns=['Year','SOH%','Total E@POI','Aug added'])
 
@@ -781,7 +796,7 @@ if 'bess_results' in st.session_state:
                     name='Aug added', marker_color='#16a34a', opacity=0.8, yaxis='y2',
                     text=[f"+{v:.0f}" for v in aug_ft['Aug added']], textposition='outside'))
             fig_ft.update_layout(
-                title=' + '.join(f'{n}PCS×{u}BESS' for n,u in ft_groups_act),
+                title=' + '.join(f'{n}PCS×{u}BESS' for n,u,_ in ft_groups_act),
                 xaxis_title="Year", yaxis=dict(title="MWh @ POI", range=[y_lo_ft, y_hi_ft]),
                 yaxis2=dict(overlaying='y', side='right', showgrid=False,
                             range=[0, max(aug_ft['Aug added'].max()*6 if len(aug_ft) else 1, 1)]),
@@ -789,8 +804,10 @@ if 'bess_results' in st.session_state:
             st.plotly_chart(fig_ft, use_container_width=True)
 
             yr_drop_ft = next((r['Year'] for r in ft_deg if r['Total E@POI'] < poi_mwh), None)
-            st.caption(f"First year below target: **{yr_drop_ft if yr_drop_ft is not None else 'Never ✅'}**  |  "
-                       f"BOL: {ft_e_poi:.1f} MWh  |  Overbuild: {ft_overbuild:+.1f}%")
+            st.caption(
+                f"First year below target: **{yr_drop_ft if yr_drop_ft is not None else 'Never ✅'}** | "
+                f"BOL: {ft_e_poi:.1f} MWh | Overbuild: {ft_overbuild:+.1f}% | "
+                f"Config: {' + '.join(f'{n}×{u}({inst.split()[0]})' for n,u,inst in ft_groups_act)}")
 
 else:  # no session state yet
     st.info("👈 Set parameters in the sidebar, then press **▶ Size All Configurations**")
