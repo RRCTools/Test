@@ -107,119 +107,118 @@ def run_pf_sweep(sbase,mpt_s,mpt_z,mpt_xr,mpt_p0kw,isu_s,isu_z,isu_xr,isu_p0kw,P
 
 # ── BESS SIZING ENGINE ────────────────────────────────────────────────────────
 def size_bess(poi_mw, poi_mwh, target_pf,
-              inv_mva, pcs_pf, base_units, batt_mwh_dc, aux_kw_per_blk,
+              inv_mva, pcs_pf, groups, batt_mwh_dc, aux_kw_per_blk,
               eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
               eta_dc, eta_chg, eta_aux,
               project_years, aug_year,
               soh_curve, cap_mvar=0.):
-
-    # Full loss chain
+    """
+    groups = list of (n_pcs, units_per_pcs) tuples.
+    E.g. [(39,4),(5,2)] = 39 PCS×4 BESS + 5 PCS×2 BESS.
+    The engine uses these exact counts for energy/power.
+    Auto-sizing suggestion is also computed for comparison.
+    """
     eta_all = eta_pcs*eta_mvt*eta_mv*eta_mpt*eta_tx*eta_dc*eta_chg*eta_aux
     soh = soh_curve + [soh_curve[-1]]*(max(project_years+2-len(soh_curve),0))
 
-    # Per-block energy at POI (base config, full load)
+    # Base group config (group 1) drives power sizing
+    base_units   = groups[0][1] if groups else 4
     blk_mwh_base = base_units * batt_mwh_dc * eta_all
 
-    # ── POWER constraint (iterative for aux) ─────────────────────────────────
+    # ── AUTO-SIZING (suggestion) ──────────────────────────────────────────────
     n = 1
     for _ in range(25):
         aux_mw   = n * aux_kw_per_blk / 1000.
         p_mpt_lv = poi_mw / (eta_mpt * eta_tx)
         p_mv     = p_mpt_lv + aux_mw
-        p_mvt    = p_mv  / eta_mv
+        p_mvt    = p_mv / eta_mv
         p_inv_nd = p_mvt / eta_mvt
         n_new    = ceil(p_inv_nd / (inv_mva * pcs_pf))
         if n_new == n: break
         n = n_new
     n_power = n
-
-    # ── ENERGY constraint ─────────────────────────────────────────────────────
-    # aug_year=0  → no augmentation: base must sustain target for FULL project life
-    #               n_energy = ceil(mwh / (blk_mwh * SOH[project_years]))
-    # aug_year>0  → base must sustain target only UNTIL aug_year
-    #               n_energy = ceil(mwh / (blk_mwh * SOH[aug_year]))
-    if aug_year > 0:
-        soh_aug  = soh[min(aug_year, len(soh)-1)]
-    else:
-        soh_aug  = soh[min(project_years, len(soh)-1)]   # EOL SOH
+    soh_aug  = soh[min(aug_year, len(soh)-1)] if aug_year > 0 else soh[min(project_years, len(soh)-1)]
     n_energy = ceil(poi_mwh / (blk_mwh_base * soh_aug))
-
-    n_base = max(n_power, n_energy)
-
-    # ── AUGMENTATION blocks (NEW PCS+batteries added at aug_year) ─────────────
-    # Aug blocks are NOT pre-installed. They are completely new units added at aug_year.
-    # Base PCS stay constant; aug_year just adds more PCS+battery capacity.
+    n_base_auto = max(n_power, n_energy)
     if aug_year > 0:
-        e_base_at_aug  = n_base * blk_mwh_base * soh_aug
-        aug_needed_mwh = max(poi_mwh - e_base_at_aug, 0.)
-        n_aug          = ceil(aug_needed_mwh / blk_mwh_base) if aug_needed_mwh > 0 else 0
+        e_at_aug  = n_base_auto * blk_mwh_base * soh_aug
+        n_aug_auto= ceil(max(poi_mwh - e_at_aug, 0.) / blk_mwh_base)
     else:
-        n_aug = 0
+        n_aug_auto = 0
 
-    # Power PCS = base only (aug PCS added later, not needed for day-1 power)
-    n_pcs_total = n_base          # only base PCS on day 1
-    n_batt_bol  = n_base * base_units
-    n_batt_aug  = n_aug  * base_units   # added at aug_year
+    # ── ACTUAL CONFIG from user groups ────────────────────────────────────────
+    groups_act  = [(n,u) for n,u in groups if n > 0] or [(1, base_units)]
+    total_pcs   = sum(n for n,_ in groups_act)
+    total_batt  = sum(n*u for n,u in groups_act)
+    e_dc_bol    = total_batt * batt_mwh_dc
+    e_poi_bol   = e_dc_bol * eta_all
 
-    # ── Actual power cascade ──────────────────────────────────────────────────
-    aux_mw_act = n_pcs_total * aux_kw_per_blk / 1000.
-    p_inv_act  = n_pcs_total * inv_mva * pcs_pf
-    q_inv_act  = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0))
-    s_inv_act  = n_pcs_total * inv_mva
-    p_mvt_out  = p_inv_act * eta_mvt
-    q_mvt_out  = q_inv_act * eta_mvt
-    p_mv_bus   = p_mvt_out * eta_mv
-    q_mv_bus   = q_mvt_out * eta_mv
-    p_mpt_in   = p_mv_bus - aux_mw_act
-    q_mpt_in   = q_mv_bus + cap_mvar
-    p_poi      = p_mpt_in * eta_mpt * eta_tx
-    q_poi      = q_mpt_in * eta_mpt * eta_tx
-    s_poi      = np.sqrt(p_poi**2+q_poi**2)
-    pf_poi     = p_poi/s_poi if s_poi>0 else 1.
-    q_poi_need = poi_mw * np.tan(np.arccos(target_pf))
-    s_mv_bus   = np.sqrt(p_mpt_in**2+q_mpt_in**2)
-    min_mpt_mva= s_mv_bus
+    # Group 1 = base; rest = aug/secondary
+    n_base   = groups_act[0][0]
+    n_aug    = sum(n for n,_ in groups_act[1:])
+    n_batt_g = [(n*u) for n,u in groups_act]   # batteries per group
 
-    # ── Energy cascade @ BOL ─────────────────────────────────────────────────
-    e_dc_bol   = n_base * base_units * batt_mwh_dc
-    e_poi_bol  = e_dc_bol * eta_all
+    # ── Power cascade (total PCS) ─────────────────────────────────────────────
+    n_pcs_total = total_pcs
+    aux_mw_act  = n_pcs_total * aux_kw_per_blk / 1000.
+    p_inv_act   = n_pcs_total * inv_mva * pcs_pf
+    q_inv_act   = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0))
+    s_inv_act   = n_pcs_total * inv_mva
+    p_mvt_out   = p_inv_act * eta_mvt
+    q_mvt_out   = q_inv_act * eta_mvt
+    p_mv_bus    = p_mvt_out * eta_mv
+    q_mv_bus    = q_mvt_out * eta_mv
+    p_mpt_in    = p_mv_bus - aux_mw_act
+    q_mpt_in    = q_mv_bus + cap_mvar
+    p_poi       = p_mpt_in * eta_mpt * eta_tx
+    q_poi       = q_mpt_in * eta_mpt * eta_tx
+    s_poi       = np.sqrt(p_poi**2+q_poi**2)
+    pf_poi      = p_poi/s_poi if s_poi>0 else 1.
+    q_poi_need  = poi_mw * np.tan(np.arccos(target_pf))
+    s_mv_bus    = np.sqrt(p_mpt_in**2+q_mpt_in**2)
+    min_mpt_mva = s_mv_bus
 
-    # ── Degradation schedule ──────────────────────────────────────────────────
-    e_base_bol = n_base * blk_mwh_base
-    e_aug_bol  = n_aug  * blk_mwh_base   # aug fresh at aug_year
+    # ── Degradation: each group degrades at same SOH curve ───────────────────
+    # Group 1 (base) installed at BOL; group 2+ treated as aug (installed at aug_year)
+    e_group_bol = [n*u*batt_mwh_dc*eta_all for n,u in groups_act]
 
     deg = []
     for yr in range(project_years+1):
-        s_yr = soh[min(yr, len(soh)-1)]
-        e_b  = e_base_bol * s_yr
-        if aug_year > 0 and yr >= aug_year:
-            s_rel = soh[min(yr-aug_year, len(soh)-1)]
-            e_aug = e_aug_bol * s_rel
-        else:
-            e_aug = 0.
-        e_tot   = e_b + e_aug
-        aug_evt = round(e_aug_bol, 1) if (aug_year > 0 and yr == aug_year) else 0.
+        s_yr  = soh[min(yr, len(soh)-1)]
+        e_tot = 0.
+        aug_event = 0.
+        for gi, eg in enumerate(e_group_bol):
+            if gi == 0:
+                # Base group: installed at BOL, degrades from yr 0
+                e_tot += eg * s_yr
+            else:
+                # Secondary groups: installed at aug_year, degrade from aug_year
+                if aug_year > 0 and yr >= aug_year:
+                    s_rel  = soh[min(yr - aug_year, len(soh)-1)]
+                    e_tot += eg * s_rel
+                    if yr == aug_year:
+                        aug_event += eg
         deg.append({'Year':yr, 'SOH (%)':round(s_yr*100,2),
-                    'Base E@POI (MWh)':round(e_b,1),
-                    'Aug E added (MWh)':aug_evt,
+                    'G1 E@POI (MWh)':round(e_group_bol[0]*s_yr,1),
+                    'Aug E added (MWh)':round(aug_event,1),
                     'Total E@POI (MWh)':round(e_tot,1)})
     deg_df = pd.DataFrame(deg)
+    # Rename base column
+    deg_df = deg_df.rename(columns={'G1 E@POI (MWh)':'Base E@POI (MWh)'})
 
-    # ── 3 Checks (Excel R29-R31) ─────────────────────────────────────────────
-    q_poi_target    = poi_mw * np.tan(np.arccos(target_pf))
-    # Q available at MV bus from inverters (before MPT, after MVT+MV cable)
-    q_actual_mvbus  = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2, 0)) * eta_mvt * eta_mv + cap_mvar
-    # Q needed at MV bus: scale POI target by actual cascade ratio
-    q_needed_mvbus  = q_poi_target * (q_mpt_in / q_poi) if q_poi > 0.01 else q_poi_target / max(eta_mpt*eta_tx, 0.01)
+    # ── 3 Checks ─────────────────────────────────────────────────────────────
+    q_poi_target   = poi_mw * np.tan(np.arccos(target_pf))
+    q_actual_mvbus = n_pcs_total * inv_mva * np.sqrt(max(1-pcs_pf**2,0)) * eta_mvt * eta_mv + cap_mvar
+    q_needed_mvbus = q_poi_target * (q_mpt_in/q_poi) if q_poi > 0.01 else q_poi_target/max(eta_mpt*eta_tx,0.01)
 
-    # Overbuild: last year energy stays above target (aug_year=0 case)
     overbuild_years = 0
+    e_base_bol = e_group_bol[0]
     for _yr in range(project_years+1):
         if e_base_bol * soh[min(_yr, len(soh)-1)] >= poi_mwh:
             overbuild_years = _yr
-    overbuild_pct   = (e_poi_bol - poi_mwh) / poi_mwh * 100
+    overbuild_pct = (e_poi_bol - poi_mwh) / poi_mwh * 100
 
-    # ── Cascade dict for SLD ──────────────────────────────────────────────────
+    # ── Cascade dict for SLD ─────────────────────────────────────────────────
     def pf_(p,q): return p/np.sqrt(p**2+q**2) if np.sqrt(p**2+q**2)>0 else 1.
     cascade = {
         'Inverter\nOutput': {'P':p_inv_act,'Q':q_inv_act,'S':s_inv_act,'PF':pcs_pf},
@@ -229,19 +228,25 @@ def size_bess(poi_mw, poi_mwh, target_pf,
     }
 
     return {
-        # Quantities
+        # User groups
+        'groups_act': groups_act,
+        'n_batt_g':   n_batt_g,
+        # Summary quantities
         'n_base':n_base,'n_aug':n_aug,'n_pcs':n_pcs_total,
-        'n_batt_bol':n_batt_bol,'n_batt_aug':n_batt_aug,
+        'n_batt_bol':total_batt, 'n_batt_aug': sum(n*u for n,u in groups_act[1:]),
         'base_units':base_units,
+        # Auto-sizing suggestion
+        'n_base_auto':n_base_auto,'n_aug_auto':n_aug_auto,
+        'n_power':n_power,'n_energy':n_energy,
         # Power
         'p_poi':p_poi,'q_poi':q_poi,'s_inv':s_inv_act,
         'min_mpt_mva':min_mpt_mva,'aux_mw':aux_mw_act,
         'p_mv_bus':p_mv_bus,'q_mv_bus':q_mv_bus,
         'p_mpt_in':p_mpt_in,'q_mpt_in':q_mpt_in,
-        'p_inv_nd':p_inv_nd,
+        'p_inv_nd':p_inv_nd, 'p_loss_pct':(1-eta_all)*100,
         # Energy
-        'e_poi_bol':e_poi_bol,'e_dc_bol':n_base*base_units*batt_mwh_dc+n_aug*aug_units_bol*batt_mwh_dc,
-        # ── 3 Checks (Excel R29-R31) ─────────────────────────────────────
+        'e_poi_bol':e_poi_bol,'e_dc_bol':e_dc_bol,
+        # 3 Checks (Excel R29-R31)
         'check1_energy':   e_poi_bol >= poi_mwh * 0.999,
         'check2_power':    p_poi >= poi_mw * 0.999,
         'check3_reactive': q_actual_mvbus >= q_needed_mvbus * 0.999,
@@ -254,9 +259,7 @@ def size_bess(poi_mw, poi_mwh, target_pf,
         'p_meets':p_poi>=poi_mw*.999,'e_meets':e_poi_bol>=poi_mwh*.999,
         'q_meets':q_actual_mvbus>=q_needed_mvbus*.999,'q_poi_need':q_poi_target,
         # Drivers
-        'n_power':n_power,'n_energy':n_energy,
-        'blk_mwh_base':blk_mwh_base,'eta_all':eta_all,
-        'soh_aug':soh_aug,
+        'blk_mwh_base':blk_mwh_base,'eta_all':eta_all,'soh_aug':soh_aug,
         # Tables
         'cascade':cascade,'deg_df':deg_df,
     }
@@ -323,12 +326,45 @@ with st.sidebar:
     eta_pcs=st.number_input("PCS η", value=0.985, min_value=.8, max_value=1., step=.001, format="%.3f")
 
     st.markdown('<div class="sec">Battery Unit</div>', unsafe_allow_html=True)
-    batt_model=st.text_input("Battery Model", value="BESS Unit")
-    c9,c10=st.columns(2)
-    batt_mwh    =c9.number_input("MWh/unit(DC)", value=6.138, min_value=.1, step=.1, format="%.3f")
-    base_units  =c10.number_input("Units/block(base)", value=4, min_value=1,
-        help="Batteries per PCS in the base build")
-    aux_kw=st.number_input("Aux load/block(kW)", value=75.6, min_value=0., step=1.)
+    batt_model = st.text_input("Battery Model", value="BESS Unit")
+    batt_mwh   = st.number_input("MWh / unit (DC)", value=6.138, min_value=.1, step=.1, format="%.3f")
+    aux_kw     = st.number_input("Aux load / block (kW)", value=75.6, min_value=0., step=1.)
+
+    st.markdown('<div class="sec">PCS → Battery Groups</div>', unsafe_allow_html=True)
+    st.caption("Define 1–3 groups. Each group: N PCS blocks, each with K batteries.")
+    st.markdown('<div style="font-size:.72rem;color:#8b949e;margin-bottom:6px">Example: 39×4 + 5×2</div>', unsafe_allow_html=True)
+
+    n_groups = int(st.number_input("Number of groups", value=1, min_value=1, max_value=3, step=1))
+    group_colors = ["#1f6feb","#238636","#9e6a03"]
+    group_labels = ["Base","Aug/Partial","Extra"]
+    group_defaults_n = [44, 0, 0]
+    group_defaults_u = [4, 2, 4]
+
+    groups = []
+    for g in range(n_groups):
+        st.markdown(
+            f'<div style="border-left:3px solid {group_colors[g]};padding:2px 0 2px 8px;'
+            f'margin:4px 0;font-size:.78rem;color:#c9d1d9"><b>Group {g+1} — {group_labels[g]}</b></div>',
+            unsafe_allow_html=True)
+        gc1, gc2 = st.columns(2)
+        gn = gc1.number_input(f"# PCS", value=group_defaults_n[g], min_value=0, key=f"gn{g}",
+                               label_visibility="visible")
+        gu = gc2.number_input(f"BESS/PCS", value=group_defaults_u[g], min_value=0, max_value=20, key=f"gu{g}",
+                               label_visibility="visible")
+        groups.append((int(gn), int(gu)))
+
+    # Always ensure at least one group with PCS > 0
+    groups_active = [(n,u) for n,u in groups if n > 0]
+    if not groups_active:
+        groups_active = [(1, 4)]
+
+    total_pcs  = sum(n for n,_ in groups_active)
+    total_batt = sum(n*u for n,u in groups_active)
+    total_dc   = total_batt * batt_mwh
+    st.caption(f"PCS: **{total_pcs}** | Batteries: **{total_batt}** | DC: **{total_dc:.1f} MWh**")
+
+    # base_units = batteries per PCS in group 1 (used by power sizing engine)
+    base_units = groups_active[0][1]
 
     st.markdown('<div class="sec">MVT/ISU</div>', unsafe_allow_html=True)
     c11,c12=st.columns(2)
@@ -377,7 +413,7 @@ if run_btn:
     with st.spinner("Sizing…"):
         res = size_bess(
             poi_mw, poi_mwh, target_pf,
-            inv_mva, pcs_pf, int(base_units), batt_mwh, aux_kw,
+            inv_mva, pcs_pf, groups_active, batt_mwh, aux_kw,
             eta_pcs, eta_mvt, eta_mv, eta_mpt, eta_tx,
             eta_dc, eta_chg, eta_aux,
             int(proj_yrs), int(aug_year),
@@ -387,22 +423,38 @@ if run_btn:
     # ── Equipment quantities ─────────────────────────────────────────────────
     st.subheader("📦 Equipment Quantities")
 
-    st.markdown(f"""
-    <div class="base-box">
-    <b>🏗 BASE BUILD (Day 1)</b><br>
-    <b>{res['n_base']}</b> PCS blocks × {int(base_units)} batteries = <b>{res['n_batt_bol']}</b> battery units installed
-    </div>
-    """, unsafe_allow_html=True)
+    # Group breakdown boxes
+    group_colors = ["#1f6feb","#238636","#9e6a03"]
+    group_labels = ["Base Build","Aug / Partial","Extra"]
+    for gi, (gn, gu) in enumerate(res['groups_act']):
+        gbatts = res['n_batt_g'][gi]
+        ge_dc  = gbatts * batt_mwh
+        ge_poi = ge_dc * res['eta_all']
+        tag    = group_labels[gi] if gi < len(group_labels) else f"Group {gi+1}"
+        install_note = "Day 1" if gi == 0 else (f"Year {int(aug_year)}" if int(aug_year) > 0 else "Day 1")
+        bg    = ["#0c1929","#0f2c1a","#2c2000"][gi % 3]
+        brd   = group_colors[gi % len(group_colors)]
+        html  = (
+            f'<div style="background:{bg};border:1px solid {brd};border-radius:6px;'
+            f'padding:10px 14px;margin:4px 0;font-size:.85rem">'
+            f'<b>{'🏗' if gi==0 else '🔄'} Group {gi+1} — {tag}</b> &nbsp;'
+            f'<span style="font-size:.72rem;color:#8b949e">({install_note})</span><br>'
+            f'<b>{gn}</b> PCS × <b>{gu}</b> batteries = <b>{gbatts}</b> units | '
+            f'DC: <b>{ge_dc:.1f}</b> MWh | E@POI: <b>{ge_poi:.1f}</b> MWh'
+            f'</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
 
-    if res['n_aug'] > 0:
-        st.markdown(f"""
-        <div class="aug-box">
-        <b>🔄 AUGMENTATION (Year {int(aug_year)})</b><br>
-        Add <b>{res['n_aug']}</b> new PCS blocks × {int(base_units)} batteries = <b>{res['n_batt_aug']}</b> batteries<br>
-        Total PCS after aug: <b>{res['n_base']+res['n_aug']}</b> &nbsp;|&nbsp;
-        Total batteries after aug: <b>{res['n_batt_bol']+res['n_batt_aug']}</b>
-        </div>
-        """, unsafe_allow_html=True)
+    # Auto-sizing suggestion
+    if res['n_base_auto'] != res['n_base'] or res['n_aug_auto'] != res['n_aug']:
+        st.markdown(
+            f'<div style="background:#1a1a2e;border:1px solid #553c9a;border-radius:6px;'
+            f'padding:8px 12px;margin:4px 0;font-size:.80rem;color:#c9d1d9">'
+            f'💡 <b>Auto-sizing suggests:</b> {res["n_base_auto"]} base PCS × {base_units} batteries'
+            f'{f" + {res["n_aug_auto"]} aug PCS" if res["n_aug_auto"]>0 else ""}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
 
     q1,q2,q3,q4,q5 = st.columns(5)
     q1.metric("Total PCS (BOL)", str(res['n_pcs']),
@@ -562,36 +614,48 @@ if run_btn:
         st.download_button("⬇ Degradation CSV",res['deg_df'].to_csv(index=False),"degradation.csv","text/csv")
 
     with t3:
-        rows=[
-            {"Equipment":f"PCS Block ({pcs_model})","Qty":res['n_base'],
-             "Battery units/block":int(base_units),"Total batteries":res['n_batt_bol']},
-        ]
-        if res['n_aug']>0:
-            rows.append({"Equipment":f"PCS Block + Batteries added @ Year {int(aug_year)}","Qty":res['n_aug'],
-                "Battery units/block":int(base_units),"Total batteries":res['n_batt_aug']})
+        glabels = ["Base","Aug/Partial","Extra"]
+        rows = []
+        for gi, (gn, gu) in enumerate(res['groups_act']):
+            lbl = glabels[gi] if gi < len(glabels) else f"Group {gi+1}"
+            install = "Day 1" if gi==0 else (f"Year {int(aug_year)}" if int(aug_year)>0 else "Day 1")
+            rows.append({
+                "Group": f"G{gi+1} — {lbl} ({install})",
+                "PCS qty": gn,
+                "BESS/PCS": gu,
+                "Total BESS": gn*gu,
+                "DC MWh": round(gn*gu*batt_mwh, 1),
+                "E@POI MWh": round(gn*gu*batt_mwh*res['eta_all'], 1),
+            })
         rows += [
-            {"Equipment":"MVT (Medium Voltage Transformer)","Qty":res['n_pcs'],
-             "Battery units/block":"—","Total batteries":f"{res['n_pcs']*mvt_mva:.0f} MVA total"},
-            {"Equipment":"MPT (Main Power Transformer)","Qty":n_mpt,
-             "Battery units/block":"—","Total batteries":f"{n_mpt*s_mpt:.0f} MVA (min {res['min_mpt_mva']:.1f})"},
+            {"Group":"MVT","PCS qty":res['n_pcs'],"BESS/PCS":"—","Total BESS":"—",
+             "DC MWh":"—","E@POI MWh":f"{res['n_pcs']*mvt_mva:.0f} MVA total"},
+            {"Group":"MPT","PCS qty":n_mpt,"BESS/PCS":"—","Total BESS":"—",
+             "DC MWh":"—","E@POI MWh":f"{n_mpt*s_mpt:.0f} MVA (min {res['min_mpt_mva']:.1f})"},
         ]
-        st.dataframe(pd.DataFrame(rows).set_index("Equipment"),use_container_width=True)
-        st.download_button("⬇ Equipment CSV",pd.DataFrame(rows).to_csv(index=False),"equipment.csv","text/csv")
+        df_eq = pd.DataFrame(rows)
+        st.dataframe(df_eq.set_index("Group"), use_container_width=True)
+        st.download_button("⬇ Equipment CSV", df_eq.to_csv(index=False), "equipment.csv","text/csv")
 
     with t4:
-        driver="POWER" if res['n_power']>=res['n_energy'] else "ENERGY"
-        soh_aug_disp=f"SOH[{aug_year}]={res['soh_aug']:.4f}" if aug_year>0 else "no augmentation"
-        st.info(f"""
-**Sizing driver: {driver}**
-
-| Constraint | Formula | Result |
-|-----------|---------|--------|
-| Power | `ceil({res['p_inv_nd']:.1f} MW ÷ ({inv_mva}×{pcs_pf}))` | **{res['n_power']} blocks** |
-| Energy | `ceil({poi_mwh:.0f} ÷ ({res['blk_mwh_base']:.2f} × {soh_aug_disp}))` | **{res['n_energy']} blocks** |
-| **n_base** | `max({res['n_power']}, {res['n_energy']})` | **{res['n_base']} blocks** |
-| **n_aug** | `ceil(gap@yr{aug_year} / blk_mwh)` | **{res['n_aug']} blocks** |
-| **Total base PCS** | n_base | **{res['n_pcs']}** |
-        """)
+        driver = "POWER" if res['n_power']>=res['n_energy'] else "ENERGY"
+        soh_lbl = f"SOH[{int(aug_year)}]={res['soh_aug']:.4f}" if int(aug_year)>0 else f"SOH[{int(proj_yrs)}]={res['soh_aug']:.4f}"
+        st.markdown("#### Auto-Sizing Suggestion")
+        st.info(
+            f"Driver: **{driver}** | "
+            f"n_power={res['n_power']}, n_energy={res['n_energy']} ({soh_lbl}) → "
+            f"**n_base_auto={res['n_base_auto']}** + n_aug_auto={res['n_aug_auto']}\n\n"
+            f"Your config: {' + '.join(f'{n}×{u}batt' for n,u in res['groups_act'])} "
+            f"= **{res['n_pcs']} PCS, {res['n_batt_bol']} batteries**"
+        )
+        st.markdown("#### User Groups vs Auto")
+        gdf_rows = []
+        for gi,(gn,gu) in enumerate(res['groups_act']):
+            gdf_rows.append({'Group':f'G{gi+1}','PCS':gn,'BESS/PCS':gu,
+                'DC MWh':round(gn*gu*batt_mwh,1),'E@POI MWh':round(gn*gu*batt_mwh*res['eta_all'],1)})
+        gdf_rows.append({'Group':'TOTAL','PCS':res['n_pcs'],'BESS/PCS':'—',
+            'DC MWh':round(res['e_dc_bol'],1),'E@POI MWh':round(res['e_poi_bol'],1)})
+        st.dataframe(pd.DataFrame(gdf_rows).set_index('Group'),use_container_width=True)
 
         loss_df=pd.DataFrame([
             {"Stage":"Transmission","η":eta_tx},{"Stage":"MPT","η":eta_mpt},
